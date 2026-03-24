@@ -2,5 +2,7 @@
     "api_key": "PASTE_YOUR_GEMINI_API_KEY_HERE",
     "target_field": "Extra",
     "limit_daily_gemini_requests": true,
-    "daily_gemini_request_cap": 250
+    "daily_gemini_request_cap": 250,
+    "anking_uworld_tag_mode": "step2_v12",
+    "custom_uworld_tag_prefix": ""
 }

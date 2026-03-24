@@ -12,7 +12,7 @@ Anki add-on for **COMLEX / NBOME-focused pearls** on top of your UWorld-tagged c
    Open [Google AI Studio](https://aistudio.google.com/apikey), sign in, and create an API key.
 
 2. **Paste it into Anki**  
-   In Anki: **Tools → Add-ons** → select **NBOME Pearl Injector** → **Config**. A **settings window** opens (API key field, target field, daily-limit checkbox, and max requests per day). Paste your key there and click **OK**.  
+   In Anki: **Tools → Add-ons** → select **NBOME Pearl Injector** → **Config**. A **settings window** opens (API key, target field, daily limit, optional **custom UWorld tag prefix** for non-standard AnKing paths). Paste your key there and click **OK**.  
    Advanced users can still use **View Files** / `meta.json` if they prefer raw JSON.
 
    **Daily limit (matches Google’s free tier for this model):**  
@@ -28,18 +28,21 @@ Anki add-on for **COMLEX / NBOME-focused pearls** on top of your UWorld-tagged c
    **Maintainers / staying up to date:** There is **no reliable automatic way** for this add-on to pull Google’s live free-tier numbers (Google does not publish a small, stable “free RPD” endpoint meant for third-party clients). When Google changes quotas, update your **Config** `daily_gemini_request_cap` to match, and for a new release bump the defaults in `config.json` and `_DEFAULT_DAILY_CAP` in `__init__.py`. Re-check periodically: bookmark **[Rate limits](https://ai.google.dev/gemini-api/docs/rate-limits)** and your **[AI Studio](https://aistudio.google.com/)** usage.
 
 3. **Run the tool**  
-   **Tools → Inject NBOME Pearls (UWorld IDs)** → enter IDs (commas or line breaks) → wait for the progress bar → done.
+   **Tools → Inject NBOME Pearls (UWorld IDs)** → choose **deck/version** (Step 1 or 2, v11 or v12 — same idea as UWorld Batch Unsuspend) → paste IDs (commas or line breaks) → **OK** → wait for the progress bar.
 
 ---
 
 ## Scope (read this first)
 
-This add-on is **optimized for the common AnKing Step 2 / Level 2 style layout**:
+This add-on is **optimized for the common AnKing Step 1 / Step 2 style layout**:
 
-- **Card text:** reads from **`Text`** or **`Front`**, and **`Back Extra`** or **`Back`** (in that order).
-- **Finding cards:** uses Anki search `tag:*<UWorld ID>*` for each ID you enter (same idea as tagging notes with the question number).
+- **Card text:** reads from **`Text`** or **`Front`**, and **`Back Extra`** or **`Back`** (in that order).  
+- **AI prompt:** when you pick **Step 1** tracks, the model is instructed as a **COMLEX Level 1** tutor; **Step 2** tracks use **COMLEX Level 2**. Custom prefixes that contain `Step1` vs `Step2` in the AnKing style are mapped the same way; **Legacy** mode defaults to Level 2.
+- **Finding cards (default):** for each ID, searches the **exact AnKing hierarchical tag** for the track you pick, e.g. `tag:"#AK_Step2_v12::#UWorld::Step::2857"` (Step 2 + v12 + UWorld ID `2857`). That keeps Step 1 vs Step 2 and v11 vs v12 from mixing.  
+- **Legacy mode:** optional **“tag contains ID (any deck)”** — the old broad `tag:*ID*` behavior if you need it.  
+- **Custom prefix:** in **Config**, set **Custom UWorld tag prefix** to the part of the tag **before** the numeric ID (e.g. `#AK_Step2_v12::#UWorld::Step::`), then choose **Custom prefix** in the inject dialog — useful if AnKing renames tags or you use another deck’s hierarchy.
 
-If your deck uses different field names or tag patterns, the add-on may skip notes or find nothing until you align tags/fields or adjust config.
+If your deck uses different field names or tag patterns, the add-on may skip notes or find nothing until you align tags/fields or adjust the track / custom prefix.
 
 ---
 

@@ -14,12 +14,13 @@ from aqt.qt import (
     QAction,
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
+    QPlainTextEdit,
     QSpinBox,
     QVBoxLayout,
     qconnect,
@@ -42,6 +43,23 @@ _USAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".nbome_g
 _DEFAULT_DAILY_CAP = 250
 _PLACEHOLDER_API_KEY = "PASTE_YOUR_GEMINI_API_KEY_HERE"
 
+# AnKing hierarchical UWorld tags, e.g. tag:#AK_Step2_v12::#UWorld::Step::2857
+_UWORLD_TAG_PRESETS: dict[str, str] = {
+    "step1_v11": "#AK_Step1_v11::#UWorld::Step::",
+    "step1_v12": "#AK_Step1_v12::#UWorld::Step::",
+    "step2_v11": "#AK_Step2_v11::#UWorld::Step::",
+    "step2_v12": "#AK_Step2_v12::#UWorld::Step::",
+}
+
+_INJECT_TRACK_CHOICES: tuple[tuple[str, str], ...] = (
+    ("step1_v11", "Step_1_v11"),
+    ("step1_v12", "Step_1_v12"),
+    ("step2_v11", "Step_2_v11"),
+    ("step2_v12", "Step_2_v12"),
+    ("custom", "Custom prefix (from Add-on Config)"),
+    ("legacy_wildcard", "Legacy: tag contains ID (any deck)"),
+)
+
 
 def _addon_config() -> dict[str, Any]:
     cfg = mw.addonManager.getConfig(__name__)
@@ -62,11 +80,18 @@ def _merged_ui_config() -> dict[str, Any]:
         cap = _DEFAULT_DAILY_CAP
     if cap < 1:
         cap = _DEFAULT_DAILY_CAP
+    custom_pf = (raw.get("custom_uworld_tag_prefix") or "").strip()
+    mode = (raw.get("anking_uworld_tag_mode") or "step2_v12").strip()
+    valid_modes = {k for k, _ in _INJECT_TRACK_CHOICES}
+    if mode not in valid_modes:
+        mode = "step2_v12"
     return {
         "api_key": api,
         "target_field": tf,
         "limit_daily_gemini_requests": limit,
         "daily_gemini_request_cap": cap,
+        "custom_uworld_tag_prefix": custom_pf,
+        "anking_uworld_tag_mode": mode,
     }
 
 
@@ -103,11 +128,23 @@ def _show_config_dialog() -> None:
     )
     hint.setWordWrap(True)
 
+    custom_prefix_edit = QLineEdit(dlg)
+    custom_prefix_edit.setText(initial["custom_uworld_tag_prefix"])
+    custom_prefix_edit.setPlaceholderText(
+        "e.g. #AK_Step2_v12::#UWorld::Step::   (no ID at the end)"
+    )
+    prefix_hint = QLabel(
+        "Used when the inject dialog is set to “Custom prefix”. Must match your deck’s "
+        "hierarchical tag up to (but not including) the numeric UWorld ID."
+    )
+    prefix_hint.setWordWrap(True)
+
     form = QFormLayout()
     form.addRow("Gemini API key:", api_edit)
     form.addRow("Target field:", field_edit)
     form.addRow(limit_cb)
     form.addRow("Max requests per day:", cap_spin)
+    form.addRow("Custom UWorld tag prefix:", custom_prefix_edit)
 
     buttons = QDialogButtonBox(
         QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -117,6 +154,7 @@ def _show_config_dialog() -> None:
 
     root = QVBoxLayout(dlg)
     root.addLayout(form)
+    root.addWidget(prefix_hint)
     root.addWidget(hint)
     root.addWidget(buttons)
 
@@ -124,12 +162,16 @@ def _show_config_dialog() -> None:
         return
 
     key = api_edit.text().strip()
-    new_cfg: dict[str, Any] = {
-        "api_key": key if key else _PLACEHOLDER_API_KEY,
-        "target_field": field_edit.text().strip() or "Extra",
-        "limit_daily_gemini_requests": bool(limit_cb.isChecked()),
-        "daily_gemini_request_cap": int(cap_spin.value()),
-    }
+    new_cfg = dict(_addon_config())
+    new_cfg.update(
+        {
+            "api_key": key if key else _PLACEHOLDER_API_KEY,
+            "target_field": field_edit.text().strip() or "Extra",
+            "limit_daily_gemini_requests": bool(limit_cb.isChecked()),
+            "daily_gemini_request_cap": int(cap_spin.value()),
+            "custom_uworld_tag_prefix": custom_prefix_edit.text().strip(),
+        }
+    )
     mw.addonManager.writeConfig(__name__, new_cfg)
 
 
@@ -231,6 +273,102 @@ def _parse_uworld_ids(raw: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+def _format_quoted_tag_search(full_tag: str) -> str:
+    """Exact hierarchical tag search; quoted so #, ::, etc. are literal."""
+    escaped = full_tag.replace("\\", "\\\\").replace('"', '\\"')
+    return f'tag:"{escaped}"'
+
+
+def _build_uworld_search_query(uw_id: str, mode: str, custom_prefix: str) -> str:
+    if mode == "legacy_wildcard":
+        return f"tag:*{uw_id}*"
+    if mode == "custom":
+        p = (custom_prefix or "").strip()
+        full = f"{p}{uw_id}"
+        return _format_quoted_tag_search(full)
+    prefix = _UWORLD_TAG_PRESETS.get(mode) or _UWORLD_TAG_PRESETS["step2_v12"]
+    full = f"{prefix}{uw_id}"
+    return _format_quoted_tag_search(full)
+
+
+def _comlex_level_from_track(mode: str, custom_prefix: str) -> int:
+    """1 = COMLEX Level 1 (Step 1 deck), 2 = COMLEX Level 2 (Step 2 deck)."""
+    if mode.startswith("step1_"):
+        return 1
+    if mode.startswith("step2_"):
+        return 2
+    if mode == "custom":
+        p = custom_prefix or ""
+        if re.search(r"#AK_Step1|_Step1_|Step1_v", p, re.IGNORECASE):
+            return 1
+        if re.search(r"#AK_Step2|_Step2_|Step2_v", p, re.IGNORECASE):
+            return 2
+        return 2
+    return 2
+
+
+def _show_inject_dialog() -> tuple[list[str], str] | None:
+    merged = _merged_ui_config()
+    dlg = QDialog(mw)
+    dlg.setWindowTitle("NBOME Pearl Injector")
+    dlg.setMinimumWidth(500)
+    dlg.setMinimumHeight(320)
+
+    intro = QLabel(
+        "Pick the AnKing track that matches your card tags (same deck/version as in "
+        "UWorld Batch Unsuspend). Only notes under that tag path are included."
+    )
+    intro.setWordWrap(True)
+
+    track = QComboBox(dlg)
+    for key, label in _INJECT_TRACK_CHOICES:
+        track.addItem(label, key)
+    cur = merged["anking_uworld_tag_mode"]
+    ix = track.findData(cur)
+    if ix < 0:
+        ix = track.findData("step2_v12")
+    track.setCurrentIndex(max(0, ix))
+
+    ids_box = QPlainTextEdit(dlg)
+    ids_box.setPlaceholderText("UWorld IDs — comma or line separated")
+
+    form = QFormLayout()
+    form.addRow("Deck / version:", track)
+
+    buttons = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+    )
+    qconnect(buttons.rejected, dlg.reject)
+
+    payload: dict[str, Any] = {}
+
+    def _on_ok() -> None:
+        uw_ids = _parse_uworld_ids(ids_box.toPlainText())
+        if not uw_ids:
+            showWarning("Enter at least one UWorld question ID.")
+            return
+        mode = str(track.currentData())
+        payload["ids"] = uw_ids
+        payload["mode"] = mode
+        new_c = dict(_addon_config())
+        new_c["anking_uworld_tag_mode"] = mode
+        mw.addonManager.writeConfig(__name__, new_c)
+        dlg.accept()
+
+    qconnect(buttons.accepted, _on_ok)
+
+    root = QVBoxLayout(dlg)
+    root.addWidget(intro)
+    root.addLayout(form)
+    root.addWidget(QLabel("UWorld question IDs:"))
+    root.addWidget(ids_box)
+    root.addWidget(buttons)
+
+    if dlg.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return payload["ids"], str(payload["mode"])
+
+
 def _field_text(note: Any, *names: str) -> str:
     for name in names:
         try:
@@ -245,12 +383,23 @@ def _field_text(note: Any, *names: str) -> str:
     return ""
 
 
-def _call_gemini(api_key: str, front: str, back: str) -> str:
+def _call_gemini(
+    api_key: str, front: str, back: str, *, comlex_level: int
+) -> str:
+    if comlex_level == 1:
+        nuances = (
+            "Provide 1-2 highly tested NBOME nuances appropriate for COMLEX Level 1 "
+            "(foundational integration, OMM principles, viscerosomatic/Chapman-style facts where relevant).\n"
+        )
+    else:
+        nuances = (
+            "Provide 1-2 highly tested NBOME nuances appropriate for COMLEX Level 2 "
+            "(e.g., viscerosomatic levels, Chapman points, classic OMM next best steps).\n"
+        )
     prompt = (
-        "Act as an expert COMLEX Level 2 tutor.\n"
+        f"Act as an expert COMLEX Level {comlex_level} tutor.\n"
         "Read the following medical flashcard.\n"
-        "Provide 1-2 highly tested NBOME nuances related to this topic "
-        "(e.g., viscerosomatic levels, Chapman points, classic OMM next best steps).\n"
+        f"{nuances}"
         "Output ONLY the raw text to be added to the flashcard. "
         "Do not include formatting, introductions, or pleasantries. "
         "Make it concise and high-yield.\n\n"
@@ -350,24 +499,30 @@ def _inject_nbome_pearls_impl() -> None:
 
     target_field = (cfg.get("target_field") or "Extra").strip() or "Extra"
 
-    raw_ids, ok = QInputDialog.getMultiLineText(
-        mw,
-        "NBOME Pearl Injector",
-        "Enter UWorld question IDs (comma or line separated):",
-    )
-    if not ok:
+    inject = _show_inject_dialog()
+    if inject is None:
+        return
+    uw_ids, tag_mode = inject
+    cfg = _addon_config()
+    custom_prefix = (cfg.get("custom_uworld_tag_prefix") or "").strip()
+
+    if tag_mode == "custom" and not custom_prefix:
+        showWarning(
+            "Custom tag prefix is empty.\n\n"
+            "Open Add-on Config and set “Custom UWorld tag prefix” "
+            "(everything before the numeric ID, e.g. #AK_Step2_v12::#UWorld::Step::), "
+            "or choose Step_1 / Step_2 and v11 / v12 above."
+        )
         return
 
-    uw_ids = _parse_uworld_ids(raw_ids)
-    if not uw_ids:
-        showWarning("No UWorld IDs were entered. Paste or type at least one ID.")
-        return
+    comlex_level = _comlex_level_from_track(tag_mode, custom_prefix)
 
     tasks: list[tuple[int, str]] = []
     seen: set[int] = set()
     for uw_id in uw_ids:
         try:
-            nids = mw.col.find_notes(f"tag:*{uw_id}*")
+            q = _build_uworld_search_query(uw_id, tag_mode, custom_prefix)
+            nids = mw.col.find_notes(q)
         except Exception:
             showWarning(
                 f"Anki could not search your collection for UWorld ID “{uw_id}”.\n\n"
@@ -381,10 +536,10 @@ def _inject_nbome_pearls_impl() -> None:
 
     if not tasks:
         showInfo(
-            "No matching notes were found.\n\n"
-            "Those UWorld IDs may not exist in your collection, or your cards may "
-            "use different tags. This add-on looks for notes with tags containing "
-            "each ID (same idea as tag search: tag:*ID*)."
+            "No matching notes were found for the selected deck/version and those IDs.\n\n"
+            "Try another track in the dropdown, use Legacy mode if your tags differ, "
+            "or set a Custom prefix in Add-on Config to match your hierarchy "
+            "(Browse → copy a full tag from one card)."
         )
         return
 
@@ -457,7 +612,9 @@ def _inject_nbome_pearls_impl() -> None:
                 continue
 
             try:
-                pearl = _call_gemini(api_key, front, back)
+                pearl = _call_gemini(
+                    api_key, front, back, comlex_level=comlex_level
+                )
             except Exception as exc:
                 errors.append(f"UWorld {uw_id}: {_friendly_api_one_line(exc)}")
                 continue

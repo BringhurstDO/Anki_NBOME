@@ -22,6 +22,7 @@ from aqt.qt import (
     QLineEdit,
     QPlainTextEdit,
     QSpinBox,
+    Qt,
     QVBoxLayout,
     qconnect,
 )
@@ -42,6 +43,8 @@ _MAX_USER_DETAIL_LEN = 450
 _USAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".nbome_gemini_usage.json")
 _DEFAULT_DAILY_CAP = 250
 _PLACEHOLDER_API_KEY = "PASTE_YOUR_GEMINI_API_KEY_HERE"
+# Direct link to create/copy keys (AI Studio); see https://aistudio.google.com/app/apikey
+_GEMINI_API_KEY_HELP_URL = "https://aistudio.google.com/app/apikey"
 
 # AnKing hierarchical UWorld tags, e.g. tag:#AK_Step2_v12::#UWorld::Step::2857
 _UWORLD_TAG_PRESETS: dict[str, str] = {
@@ -99,11 +102,38 @@ def _show_config_dialog() -> None:
     initial = _merged_ui_config()
     dlg = QDialog(mw)
     dlg.setWindowTitle("NBOME Pearl Injector — Settings")
-    dlg.setMinimumWidth(460)
+    dlg.setMinimumWidth(500)
+
+    api_header = QLabel(
+        "<b>Gemini API key (required)</b><br>"
+        "This add-on uses <i>your</i> key (Bring Your Own Key). If you have not created one before:"
+    )
+    api_header.setWordWrap(True)
+    api_header.setTextFormat(Qt.TextFormat.RichText)
+
+    api_steps = QLabel(
+        "• Open the blue link below and sign in with your Google account.<br>"
+        "• Click <b>Create API key</b> in Google AI Studio (or copy an existing key).<br>"
+        "• Paste the full key into the field under “Gemini API key”.<br>"
+        "• The key is saved only on this computer; the add-on author never receives it."
+    )
+    api_steps.setWordWrap(True)
+    api_steps.setTextFormat(Qt.TextFormat.RichText)
+
+    api_link = QLabel(
+        f'<a href="{_GEMINI_API_KEY_HELP_URL}">'
+        "→ Open Google AI Studio (API keys)</a>"
+    )
+    api_link.setOpenExternalLinks(True)
+    api_link.setWordWrap(True)
+    api_link.setTextInteractionFlags(
+        Qt.TextInteractionFlag.LinksAccessibleByMouse
+        | Qt.TextInteractionFlag.LinksAccessibleByKeyboard
+    )
 
     api_edit = QLineEdit(dlg)
     api_edit.setText(initial["api_key"])
-    api_edit.setPlaceholderText("Paste your key from Google AI Studio")
+    api_edit.setPlaceholderText("Paste your API key here after creating it in AI Studio")
 
     field_edit = QLineEdit(dlg)
     field_edit.setText(initial["target_field"])
@@ -153,6 +183,9 @@ def _show_config_dialog() -> None:
     qconnect(buttons.rejected, dlg.reject)
 
     root = QVBoxLayout(dlg)
+    root.addWidget(api_header)
+    root.addWidget(api_steps)
+    root.addWidget(api_link)
     root.addLayout(form)
     root.addWidget(prefix_hint)
     root.addWidget(hint)

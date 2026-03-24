@@ -9,7 +9,7 @@ Anki add-on for **COMLEX / NBOME-focused pearls** on top of your UWorld-tagged c
 **Bring your own key** — the add-on does not ship with an API key. You pay nothing to the author; Google’s free tier / your account covers usage.
 
 1. **Get a free Gemini API key**  
-   Open [Google AI Studio](https://aistudio.google.com/apikey), sign in, and create an API key.
+   Open **[Google AI Studio — API keys](https://aistudio.google.com/app/apikey)** (`https://aistudio.google.com/app/apikey`), sign in with Google, click **Create API key**, and copy it. (Same page linked inside the add-on’s **Config** window.)
 
 2. **Paste it into Anki**  
    In Anki: **Tools → Add-ons** → select **NBOME Pearl Injector** → **Config**. A **settings window** opens (API key, target field, daily limit, optional **custom UWorld tag prefix** for non-standard AnKing paths). Paste your key there and click **OK**.  

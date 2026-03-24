@@ -1,0 +1,534 @@
+from __future__ import annotations
+
+import html
+import json
+import os
+import re
+import urllib.error
+import urllib.request
+from datetime import date
+from typing import Any
+
+from aqt import gui_hooks, mw
+from aqt.qt import (
+    QAction,
+    QApplication,
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QSpinBox,
+    QVBoxLayout,
+    qconnect,
+)
+from aqt.utils import showInfo, showWarning
+
+
+_GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.5-flash:generateContent"
+)
+
+_SUCCESS_ATTRIBUTION = (
+    "\n\nCreated by Kyle Bringhurst | Founder of SyncSOAP"
+)
+
+_MAX_USER_DETAIL_LEN = 450
+
+_USAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".nbome_gemini_usage.json")
+_DEFAULT_DAILY_CAP = 250
+_PLACEHOLDER_API_KEY = "PASTE_YOUR_GEMINI_API_KEY_HERE"
+
+
+def _addon_config() -> dict[str, Any]:
+    cfg = mw.addonManager.getConfig(__name__)
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _merged_ui_config() -> dict[str, Any]:
+    """Values for the settings dialog (sensible defaults + user meta.json)."""
+    raw = _addon_config()
+    api = (raw.get("api_key") or "").strip()
+    if api == _PLACEHOLDER_API_KEY:
+        api = ""
+    tf = (raw.get("target_field") or "Extra").strip() or "Extra"
+    limit = _coerce_bool(raw.get("limit_daily_gemini_requests"), True)
+    try:
+        cap = int(raw.get("daily_gemini_request_cap", _DEFAULT_DAILY_CAP))
+    except (TypeError, ValueError):
+        cap = _DEFAULT_DAILY_CAP
+    if cap < 1:
+        cap = _DEFAULT_DAILY_CAP
+    return {
+        "api_key": api,
+        "target_field": tf,
+        "limit_daily_gemini_requests": limit,
+        "daily_gemini_request_cap": cap,
+    }
+
+
+def _show_config_dialog() -> None:
+    initial = _merged_ui_config()
+    dlg = QDialog(mw)
+    dlg.setWindowTitle("NBOME Pearl Injector — Settings")
+    dlg.setMinimumWidth(460)
+
+    api_edit = QLineEdit(dlg)
+    api_edit.setText(initial["api_key"])
+    api_edit.setPlaceholderText("Paste your key from Google AI Studio")
+
+    field_edit = QLineEdit(dlg)
+    field_edit.setText(initial["target_field"])
+
+    limit_cb = QCheckBox("Limit daily Gemini requests (recommended)")
+    limit_cb.setChecked(initial["limit_daily_gemini_requests"])
+
+    cap_spin = QSpinBox(dlg)
+    cap_spin.setRange(1, 99_999)
+    cap_spin.setValue(int(initial["daily_gemini_request_cap"]))
+
+    def _sync_cap_enabled(checked: bool) -> None:
+        cap_spin.setEnabled(checked)
+
+    qconnect(limit_cb.toggled, _sync_cap_enabled)
+    _sync_cap_enabled(limit_cb.isChecked())
+
+    hint = QLabel(
+        "The daily cap counts only successful pearl injections from this add-on on "
+        f"this computer (default {_DEFAULT_DAILY_CAP} ≈ typical Gemini 2.5 Flash free tier). "
+        "It is not read from Google’s servers—see the README."
+    )
+    hint.setWordWrap(True)
+
+    form = QFormLayout()
+    form.addRow("Gemini API key:", api_edit)
+    form.addRow("Target field:", field_edit)
+    form.addRow(limit_cb)
+    form.addRow("Max requests per day:", cap_spin)
+
+    buttons = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+    )
+    qconnect(buttons.accepted, dlg.accept)
+    qconnect(buttons.rejected, dlg.reject)
+
+    root = QVBoxLayout(dlg)
+    root.addLayout(form)
+    root.addWidget(hint)
+    root.addWidget(buttons)
+
+    if dlg.exec() != QDialog.DialogCode.Accepted:
+        return
+
+    key = api_edit.text().strip()
+    new_cfg: dict[str, Any] = {
+        "api_key": key if key else _PLACEHOLDER_API_KEY,
+        "target_field": field_edit.text().strip() or "Extra",
+        "limit_daily_gemini_requests": bool(limit_cb.isChecked()),
+        "daily_gemini_request_cap": int(cap_spin.value()),
+    }
+    mw.addonManager.writeConfig(__name__, new_cfg)
+
+
+def _sanitize_user_detail(text: str) -> str:
+    """Single-line, length-limited text safe to show in dialogs (not a traceback)."""
+    t = " ".join(str(text).replace("\r", " ").split())
+    if len(t) > _MAX_USER_DETAIL_LEN:
+        t = t[: _MAX_USER_DETAIL_LEN - 3].rstrip() + "..."
+    return t
+
+
+def _friendly_api_one_line(exc: BaseException) -> str:
+    """Short, single-line reason for a failed Gemini call (for batch error lists)."""
+    detail = _sanitize_user_detail(str(exc)) if exc else ""
+    if not detail:
+        return "Gemini request failed (check API key and internet)."
+    return f"Gemini request failed: {detail}"
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return default
+
+
+def _usage_state_for_today() -> tuple[str, int]:
+    """Return (iso_date, successful_request_count_today)."""
+    today = date.today().isoformat()
+    count = 0
+    try:
+        with open(_USAGE_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return today, 0
+    if not isinstance(raw, dict):
+        return today, 0
+    if raw.get("date") != today:
+        return today, 0
+    try:
+        count = int(raw.get("successful_requests", 0))
+    except (TypeError, ValueError):
+        count = 0
+    return today, max(0, count)
+
+
+def _persist_usage(today: str, total_successful_today: int) -> None:
+    try:
+        with open(_USAGE_FILE, "w", encoding="utf-8") as f:
+            json.dump(
+                {"date": today, "successful_requests": total_successful_today},
+                f,
+                indent=2,
+            )
+    except OSError:
+        pass
+
+
+def _daily_limit_settings(cfg: dict[str, Any]) -> tuple[bool, int]:
+    enforce = _coerce_bool(cfg.get("limit_daily_gemini_requests"), True)
+    try:
+        cap = int(cfg.get("daily_gemini_request_cap", _DEFAULT_DAILY_CAP))
+    except (TypeError, ValueError):
+        cap = _DEFAULT_DAILY_CAP
+    if enforce and cap < 1:
+        cap = _DEFAULT_DAILY_CAP
+    return enforce, cap
+
+
+def _usage_footer(
+    *,
+    enforce_limit: bool,
+    cap: int,
+    count_before: int,
+    updated_this_run: int,
+) -> str:
+    total = count_before + updated_this_run
+    if enforce_limit and cap >= 1:
+        return (
+            f"\n\nTracked Gemini calls today (this add-on, this device): "
+            f"{total} of {cap}. Resets at local midnight."
+        )
+    return (
+        "\n\nDaily limit is off in Config; this add-on does not cap calls. "
+        "Watch usage and billing in Google AI Studio if you are not on free-only terms."
+    )
+
+
+def _parse_uworld_ids(raw: str) -> list[str]:
+    if not raw or not raw.strip():
+        return []
+    normalized = raw.replace("\n", ",")
+    parts = re.split(r"[,]+", normalized)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _field_text(note: Any, *names: str) -> str:
+    for name in names:
+        try:
+            val = note[name]
+        except (KeyError, TypeError):
+            continue
+        if val is None:
+            continue
+        s = str(val).strip()
+        if s:
+            return s
+    return ""
+
+
+def _call_gemini(api_key: str, front: str, back: str) -> str:
+    prompt = (
+        "Act as an expert COMLEX Level 2 tutor.\n"
+        "Read the following medical flashcard.\n"
+        "Provide 1-2 highly tested NBOME nuances related to this topic "
+        "(e.g., viscerosomatic levels, Chapman points, classic OMM next best steps).\n"
+        "Output ONLY the raw text to be added to the flashcard. "
+        "Do not include formatting, introductions, or pleasantries. "
+        "Make it concise and high-yield.\n\n"
+        f"Flashcard Front: {front}\n"
+        f"Flashcard Back: {back}\n"
+    )
+    url = f"{_GEMINI_URL}?key={api_key}"
+    payload = {
+        "contents": [
+            {
+                "parts": [{"text": prompt}],
+            }
+        ],
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        try:
+            err_json = json.loads(err_body)
+            msg = err_json.get("error", {}).get("message", err_body)
+        except json.JSONDecodeError:
+            msg = err_body or f"HTTP {e.code}"
+        raise RuntimeError(_sanitize_user_detail(str(msg))) from e
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", e)
+        raise RuntimeError(_sanitize_user_detail(str(reason))) from e
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            "The API returned a response that could not be read. Please try again."
+        ) from e
+
+    if "error" in body:
+        err = body["error"]
+        msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+        raise RuntimeError(_sanitize_user_detail(str(msg)))
+
+    candidates = body.get("candidates") or []
+    if not candidates:
+        raise RuntimeError(
+            "The model returned no text (the response may have been blocked). "
+            "Try again or shorten the card content."
+        )
+
+    parts_out = candidates[0].get("content", {}).get("parts") or []
+    texts: list[str] = []
+    for part in parts_out:
+        t = part.get("text")
+        if t:
+            texts.append(t)
+    out = "".join(texts).strip()
+    if not out:
+        raise RuntimeError("The model returned an empty answer. Please try again.")
+    return out
+
+
+def _inject_nbome_pearls() -> None:
+    try:
+        _inject_nbome_pearls_impl()
+    except Exception:
+        try:
+            mw.progress.finish()
+        except Exception:
+            pass
+        showWarning(
+            "NBOME Pearl Injector ran into an unexpected problem.\n\n"
+            "Please restart Anki and try again. If it keeps happening, "
+            "report the issue with your Anki version and add-on version."
+        )
+
+
+def _inject_nbome_pearls_impl() -> None:
+    if mw.col is None:
+        showWarning(
+            "Please open a collection before using NBOME Pearl Injector."
+        )
+        return
+
+    cfg = _addon_config()
+    api_key = (cfg.get("api_key") or "").strip()
+    if not api_key or api_key == _PLACEHOLDER_API_KEY:
+        showWarning(
+            "Add your own Gemini API key first.\n\n"
+            "Tools → Add-ons → NBOME Pearl Injector → Config → paste your key.\n\n"
+            "Get a free key at Google AI Studio. Your key stays on your computer; "
+            "the author does not provide or pay for API usage."
+        )
+        return
+
+    target_field = (cfg.get("target_field") or "Extra").strip() or "Extra"
+
+    raw_ids, ok = QInputDialog.getMultiLineText(
+        mw,
+        "NBOME Pearl Injector",
+        "Enter UWorld question IDs (comma or line separated):",
+    )
+    if not ok:
+        return
+
+    uw_ids = _parse_uworld_ids(raw_ids)
+    if not uw_ids:
+        showWarning("No UWorld IDs were entered. Paste or type at least one ID.")
+        return
+
+    tasks: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    for uw_id in uw_ids:
+        try:
+            nids = mw.col.find_notes(f"tag:*{uw_id}*")
+        except Exception:
+            showWarning(
+                f"Anki could not search your collection for UWorld ID “{uw_id}”.\n\n"
+                "Make sure a deck is open and try again."
+            )
+            return
+        for nid in nids:
+            if nid not in seen:
+                seen.add(nid)
+                tasks.append((nid, uw_id))
+
+    if not tasks:
+        showInfo(
+            "No matching notes were found.\n\n"
+            "Those UWorld IDs may not exist in your collection, or your cards may "
+            "use different tags. This add-on looks for notes with tags containing "
+            "each ID (same idea as tag search: tag:*ID*)."
+        )
+        return
+
+    today, count_before = _usage_state_for_today()
+    enforce_limit, daily_cap = _daily_limit_settings(cfg)
+
+    if enforce_limit and daily_cap >= 1:
+        remaining = daily_cap - count_before
+        if remaining <= 0:
+            showWarning(
+                f"You have reached today’s local safety cap ({daily_cap} successful "
+                f"Gemini calls tracked by this add-on).\n\n"
+                "It resets at midnight on this computer’s local date, or you can change "
+                "Add-on Config: set `limit_daily_gemini_requests` to false if you accept "
+                "possible Google charges, or raise `daily_gemini_request_cap`.\n\n"
+                "Google’s real free tier and billing are shown only in Google AI Studio—"
+                "this add-on cannot read your remaining Google quota."
+            )
+            return
+        if remaining < len(tasks):
+            original_n = len(tasks)
+            tasks = tasks[:remaining]
+            showInfo(
+                f"Daily safety cap: you have {remaining} Gemini call(s) left today "
+                f"({count_before} of {daily_cap} already used by this add-on).\n\n"
+                f"This batch had {original_n} note(s); only the first {remaining} will be processed.\n\n"
+                "To process more today, raise `daily_gemini_request_cap` or set "
+                "`limit_daily_gemini_requests` to false (see README)."
+            )
+
+    mw.progress.start(
+        max=len(tasks),
+        min=0,
+        label="Injecting NBOME pearls…",
+        parent=mw,
+        immediate=True,
+    )
+    updated = 0
+    errors: list[str] = []
+    try:
+        for i, (nid, uw_id) in enumerate(tasks):
+            mw.progress.update(
+                value=i + 1,
+                label=f"NBOME pearls ({i + 1}/{len(tasks)}) — UW {uw_id}",
+            )
+            QApplication.processEvents()
+            try:
+                note = mw.col.get_note(nid)
+            except Exception:
+                errors.append(
+                    f"UWorld {uw_id}: could not open a matching note (internal error). Skipped."
+                )
+                continue
+
+            try:
+                note[target_field]
+            except Exception:
+                errors.append(
+                    f"UWorld {uw_id}: this note has no “{target_field}” field. "
+                    f"Set “target_field” in Add-on Config or fix the note type. Skipped."
+                )
+                continue
+
+            front = _field_text(note, "Text", "Front")
+            back = _field_text(note, "Back Extra", "Back")
+            if not (front or back):
+                errors.append(
+                    f"UWorld {uw_id}: no Text/Front or Back Extra/Back content found. Skipped."
+                )
+                continue
+
+            try:
+                pearl = _call_gemini(api_key, front, back)
+            except Exception as exc:
+                errors.append(f"UWorld {uw_id}: {_friendly_api_one_line(exc)}")
+                continue
+
+            safe_pearl = html.escape(pearl, quote=False).replace("\n", "<br>")
+            suffix = (
+                "<br><br><b style='color:#007BFF;'>NBOME Pearl:</b><br>"
+                f"{safe_pearl}"
+            )
+            current = note[target_field] or ""
+            note[target_field] = current + suffix
+            try:
+                mw.col.update_note(note)
+            except Exception:
+                errors.append(
+                    f"UWorld {uw_id}: could not save changes to this note. Skipped."
+                )
+                continue
+            updated += 1
+    finally:
+        mw.progress.finish()
+
+    if updated > 0:
+        _persist_usage(today, count_before + updated)
+
+    footer_usage = _usage_footer(
+        enforce_limit=enforce_limit,
+        cap=daily_cap,
+        count_before=count_before,
+        updated_this_run=updated,
+    )
+
+    if errors:
+        preview = "\n".join(errors[:6])
+        extra = f"\n\n… and {len(errors) - 6} more issue(s)." if len(errors) > 6 else ""
+        api_hint = ""
+        if any("Gemini" in line for line in errors):
+            api_hint = (
+                "\n\nIf you see Gemini or network messages, confirm your API key under "
+                "Tools → Add-ons → Config, and check quota and billing in Google AI Studio."
+            )
+        if updated == 0:
+            showWarning(
+                "No notes were updated.\n\n"
+                f"{preview}{extra}"
+                f"{api_hint}"
+                f"{footer_usage}"
+            )
+        else:
+            showWarning(
+                f"Finished with {updated} note(s) updated. "
+                f"Some items were skipped ({len(errors)}).\n\n"
+                f"{preview}{extra}"
+                f"{api_hint}"
+                f"{footer_usage}"
+            )
+        return
+
+    showInfo(
+        f"Success: injected NBOME pearls into the “{target_field}” field "
+        f"for {updated} note(s)."
+        f"{footer_usage}"
+        + _SUCCESS_ATTRIBUTION
+    )
+
+
+def _on_main_window_init() -> None:
+    mw.addonManager.setConfigAction(__name__, _show_config_dialog)
+    action = QAction("Inject NBOME Pearls (UWorld IDs)", mw)
+    qconnect(action.triggered, _inject_nbome_pearls)
+    mw.form.menuTools.addAction(action)
+
+
+gui_hooks.main_window_did_init.append(_on_main_window_init)

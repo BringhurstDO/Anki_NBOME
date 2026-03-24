@@ -1,0 +1,6 @@
+{
+    "api_key": "PASTE_YOUR_GEMINI_API_KEY_HERE",
+    "target_field": "Extra",
+    "limit_daily_gemini_requests": true,
+    "daily_gemini_request_cap": 250
+}

@@ -224,6 +224,23 @@ def _friendly_api_one_line(exc: BaseException) -> str:
     return f"Gemini request failed: {detail}"
 
 
+def _escape_preserving_b_tags(text: str) -> str:
+    """Escape HTML safely while allowing Gemini to return <b>...</b> emphasis tags.
+
+    We escape everything (so users can't inject arbitrary HTML), but preserve <b> and </b>
+    so Anki mobile renders emphasis properly.
+    """
+    if not text:
+        return ""
+    start = "__NBOME_B_START__"
+    end = "__NBOME_B_END__"
+    # Preserve literal <b> and </b> tags (Gemini should output only these for emphasis).
+    s = re.sub(r"(?i)<b\s*>", start, text)
+    s = re.sub(r"(?i)</b\s*>", end, s)
+    s = html.escape(s, quote=False)
+    return s.replace(start, "<b>").replace(end, "</b>")
+
+
 def _coerce_bool(value: Any, default: bool) -> bool:
     if value is None:
         return default
@@ -419,22 +436,23 @@ def _field_text(note: Any, *names: str) -> str:
 def _call_gemini(
     api_key: str, front: str, back: str, *, comlex_level: int
 ) -> str:
-    if comlex_level == 1:
-        nuances = (
-            "Provide 1-2 highly tested NBOME nuances appropriate for COMLEX Level 1 "
-            "(foundational integration, OMM principles, viscerosomatic/Chapman-style facts where relevant).\n"
-        )
-    else:
-        nuances = (
-            "Provide 1-2 highly tested NBOME nuances appropriate for COMLEX Level 2 "
-            "(e.g., viscerosomatic levels, Chapman points, classic OMM next best steps).\n"
-        )
+    # Universal NBOME prompt:
+    # - 1-2 nuances total, selected from the most relevant domains.
+    # - Use HTML <b> tags for emphasis only (no Markdown asterisks).
     prompt = (
-        f"Act as an expert COMLEX Level {comlex_level} tutor.\n"
+        f"Act as a Universal NBOME Expert and COMLEX Level {comlex_level} tutor.\n"
         "Read the following medical flashcard.\n"
-        f"{nuances}"
-        "Output ONLY the raw text to be added to the flashcard. "
-        "Do not include formatting, introductions, or pleasantries. "
+        "Provide 1-2 highly tested NBOME nuances that best match the flashcard content.\n"
+        "Select the most relevant nuance(s) from these domains when applicable:\n"
+        "1) OMM: viscerosomatics, Chapman points, and Muscle Energy.\n"
+        "2) Psychiatry: NBOME-preferred first-line meds and specific side effects; include geriatric warnings (e.g., avoid X in elderly) when relevant.\n"
+        "3) Ethics/Law: mandatory reporting (abuse, wounds), Tarasoff duty, and minor consent when relevant.\n"
+        "4) Public Health: USPSTF screening and CDC vaccine schedules when relevant.\n\n"
+        "Formatting rules:\n"
+        "- Output ONLY the raw text to be added to the flashcard.\n"
+        "- NEVER use Markdown asterisks (*) for bolding.\n"
+        "- If you need emphasis, use ONLY HTML <b> and </b> tags.\n"
+        "- Do NOT add headings, introductions, or bullet lists.\n"
         "Make it concise and high-yield.\n\n"
         f"Flashcard Front: {front}\n"
         f"Flashcard Back: {back}\n"
@@ -644,6 +662,11 @@ def _inject_nbome_pearls_impl() -> None:
                 )
                 continue
 
+            # Duplicate Shield: do not inject a second pearl into the same note.
+            current_target = note[target_field] or ""
+            if "NBOME Pearl:" in str(current_target):
+                continue
+
             try:
                 pearl = _call_gemini(
                     api_key, front, back, comlex_level=comlex_level
@@ -652,7 +675,7 @@ def _inject_nbome_pearls_impl() -> None:
                 errors.append(f"UWorld {uw_id}: {_friendly_api_one_line(exc)}")
                 continue
 
-            safe_pearl = html.escape(pearl, quote=False).replace("\n", "<br>")
+            safe_pearl = _escape_preserving_b_tags(pearl).replace("\n", "<br>")
             suffix = (
                 "<br><br><b style='color:#007BFF;'>NBOME Pearl:</b><br>"
                 f"{safe_pearl}"

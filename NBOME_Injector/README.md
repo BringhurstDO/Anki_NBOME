@@ -37,7 +37,9 @@ Anki add-on for **COMLEX / NBOME-focused pearls** on top of your UWorld-tagged c
 This add-on is **optimized for the common AnKing Step 1 / Step 2 style layout**:
 
 - **Card text:** reads from **`Text`** or **`Front`**, and **`Back Extra`** or **`Back`** (in that order).  
-- **AI prompt:** when you pick **Step 1** tracks, the model is instructed as a **COMLEX Level 1** tutor; **Step 2** tracks use **COMLEX Level 2**. Custom prefixes that contain `Step1` vs `Step2` in the AnKing style are mapped the same way; **Legacy** mode defaults to Level 2.
+- **Duplicate Shield:** before calling Gemini for a note, the add-on checks whether the target field already contains `NBOME Pearl:`. If it does, that note is skipped (prevents duplicate pearls).
+- **Universal NBOME Prompt:** Gemini is instructed to act as a **Universal NBOME Expert** and output **1–2** high-yield nuances selected from relevant domains (OMM: viscerosomatics/Chapman/Muscle Energy, Psychiatry: first-line meds + side effects, Ethics/Law: mandatory reporting/Tarasoff/minor consent, Public Health: USPSTF + CDC vaccines).
+- **HTML emphasis only:** Gemini is instructed to **never use Markdown `*` for bold**. For emphasis it must use **HTML `<b>...</b>`** tags, which the add-on preserves for correct rendering on Anki mobile.
 - **Finding cards (default):** for each ID, searches the **exact AnKing hierarchical tag** for the track you pick, e.g. `tag:"#AK_Step2_v12::#UWorld::Step::2857"` (Step 2 + v12 + UWorld ID `2857`). That keeps Step 1 vs Step 2 and v11 vs v12 from mixing.  
 - **Legacy mode:** optional **“tag contains ID (any deck)”** — the old broad `tag:*ID*` behavior if you need it.  
 - **Custom prefix:** in **Config**, set **Custom UWorld tag prefix** to the part of the tag **before** the numeric ID (e.g. `#AK_Step2_v12::#UWorld::Step::`), then choose **Custom prefix** in the inject dialog — useful if AnKing renames tags or you use another deck’s hierarchy.

@@ -1,8 +1,8 @@
 {
     "package": "nbome_injector",
     "name": "NBOME Pearl Injector (Gemini AI)",
-    "version": "1.0.3",
-    "mod": 1774450714,
+    "version": "1.0.4",
+    "mod": 1774537608,
     "min_point_version": 50,
     "max_point_version": 0,
     "conflicts": []

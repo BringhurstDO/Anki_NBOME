@@ -28,7 +28,9 @@ Anki add-on for **COMLEX / NBOME-focused pearls** on top of your UWorld-tagged c
    **Maintainers / staying up to date:** There is **no reliable automatic way** for this add-on to pull Google’s live free-tier numbers (Google does not publish a small, stable “free RPD” endpoint meant for third-party clients). When Google changes quotas, update your **Config** `daily_gemini_request_cap` to match, and for a new release bump the defaults in `config.json` and `_DEFAULT_DAILY_CAP` in `__init__.py`. Re-check periodically: bookmark **[Rate limits](https://ai.google.dev/gemini-api/docs/rate-limits)** and your **[AI Studio](https://aistudio.google.com/)** usage.
 
 3. **Run the tool**  
-   **Tools → Inject NBOME Pearls (UWorld IDs)** → choose **deck/version** (Step 1 or 2, v11 or v12 — same idea as UWorld Batch Unsuspend) → paste IDs (commas or line breaks) → **OK** → wait for the progress bar.
+   **Tools → Inject NBOME Pearls (UWorld IDs)** → choose **deck/version** (Step 1 or 2, v11 or v12 — same idea as UWorld Batch Unsuspend) and choose **Target Source**:  
+   - **UWorld Question IDs (Paste below)**: paste IDs (commas or line breaks), then run.  
+   - **Today's Reviews (Due Cards)**: no ID paste needed; pulls `is:due -is:suspended` scoped to your selected deck/version tag.
 
 ---
 
@@ -41,6 +43,7 @@ This add-on is **optimized for the common AnKing Step 1 / Step 2 style layout**:
 - **Universal NBOME Prompt:** Gemini is instructed to act as a **Universal NBOME Expert** and output **1–2** high-yield nuances selected from relevant domains (OMM: viscerosomatics/Chapman/Muscle Energy, Psychiatry: first-line meds + side effects, Ethics/Law: mandatory reporting/Tarasoff/minor consent, Public Health: USPSTF + CDC vaccines).
 - **HTML emphasis only:** Gemini is instructed to **never use Markdown `*` for bold**. For emphasis it must use **HTML `<b>...</b>`** tags, which the add-on preserves for correct rendering on Anki mobile.
 - **Finding cards (default):** for each ID, searches the **exact AnKing hierarchical tag** for the track you pick, e.g. `tag:"#AK_Step2_v12::#UWorld::Step::2857"` (Step 2 + v12 + UWorld ID `2857`). That keeps Step 1 vs Step 2 and v11 vs v12 from mixing.  
+- **Today's Reviews workflow:** optional mode that processes your due unsuspended cards only, scoped to the selected deck/version tag to avoid unrelated decks.
 - **Legacy mode:** optional **“tag contains ID (any deck)”** — the old broad `tag:*ID*` behavior if you need it.  
 - **Custom prefix:** in **Config**, set **Custom UWorld tag prefix** to the part of the tag **before** the numeric ID (e.g. `#AK_Step2_v12::#UWorld::Step::`), then choose **Custom prefix** in the inject dialog — useful if AnKing renames tags or you use another deck’s hierarchy.
 

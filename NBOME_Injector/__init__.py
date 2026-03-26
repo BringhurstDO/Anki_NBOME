@@ -63,6 +63,18 @@ _INJECT_TRACK_CHOICES: tuple[tuple[str, str], ...] = (
     ("legacy_wildcard", "Legacy: tag contains ID (any deck)"),
 )
 
+_TARGET_SOURCE_CHOICES: tuple[tuple[str, str], ...] = (
+    ("uworld_ids", "UWorld Question IDs (Paste below)"),
+    ("todays_reviews", "Today's Reviews (Due Cards)"),
+)
+
+_DUE_SCOPE_TAGS: dict[str, str] = {
+    "step1_v11": "#AK_Step1_v11",
+    "step1_v12": "#AK_Step1_v12",
+    "step2_v11": "#AK_Step2_v11",
+    "step2_v12": "#AK_Step2_v12",
+}
+
 
 def _addon_config() -> dict[str, Any]:
     cfg = mw.addonManager.getConfig(__name__)
@@ -357,12 +369,26 @@ def _comlex_level_from_track(mode: str, custom_prefix: str) -> int:
     return 2
 
 
-def _show_inject_dialog() -> tuple[list[str], str] | None:
+def _scope_tag_for_due_search(mode: str, custom_prefix: str) -> str | None:
+    """Return tag prefix used to scope due cards to medical deck/version."""
+    if mode in _DUE_SCOPE_TAGS:
+        return _DUE_SCOPE_TAGS[mode]
+    if mode == "custom":
+        p = (custom_prefix or "").strip()
+        if not p:
+            return None
+        # Try to keep only top-level deck marker for broad due search.
+        root = p.split("::", 1)[0].strip()
+        return root or p
+    return None
+
+
+def _show_inject_dialog() -> tuple[str, str, list[str]] | None:
     merged = _merged_ui_config()
     dlg = QDialog(mw)
     dlg.setWindowTitle("NBOME Pearl Injector")
     dlg.setMinimumWidth(500)
-    dlg.setMinimumHeight(320)
+    dlg.setMinimumHeight(360)
 
     intro = QLabel(
         "Pick the AnKing track that matches your card tags (same deck/version as in "
@@ -379,11 +405,27 @@ def _show_inject_dialog() -> tuple[list[str], str] | None:
         ix = track.findData("step2_v12")
     track.setCurrentIndex(max(0, ix))
 
+    source = QComboBox(dlg)
+    for key, label in _TARGET_SOURCE_CHOICES:
+        source.addItem(label, key)
+    source.setCurrentIndex(0)
+
     ids_box = QPlainTextEdit(dlg)
     ids_box.setPlaceholderText("UWorld IDs — comma or line separated")
+    ids_label = QLabel("UWorld question IDs:")
 
     form = QFormLayout()
     form.addRow("Deck / version:", track)
+    form.addRow("Target Source:", source)
+
+    def _sync_source_ui() -> None:
+        use_ids = str(source.currentData()) == "uworld_ids"
+        ids_box.setEnabled(use_ids)
+        ids_box.setVisible(use_ids)
+        ids_label.setVisible(use_ids)
+
+    qconnect(source.currentIndexChanged, lambda _idx: _sync_source_ui())
+    _sync_source_ui()
 
     buttons = QDialogButtonBox(
         QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -393,11 +435,15 @@ def _show_inject_dialog() -> tuple[list[str], str] | None:
     payload: dict[str, Any] = {}
 
     def _on_ok() -> None:
-        uw_ids = _parse_uworld_ids(ids_box.toPlainText())
-        if not uw_ids:
-            showWarning("Enter at least one UWorld question ID.")
-            return
+        src = str(source.currentData())
+        uw_ids: list[str] = []
+        if src == "uworld_ids":
+            uw_ids = _parse_uworld_ids(ids_box.toPlainText())
+            if not uw_ids:
+                showWarning("Enter at least one UWorld question ID.")
+                return
         mode = str(track.currentData())
+        payload["source"] = src
         payload["ids"] = uw_ids
         payload["mode"] = mode
         new_c = dict(_addon_config())
@@ -410,13 +456,13 @@ def _show_inject_dialog() -> tuple[list[str], str] | None:
     root = QVBoxLayout(dlg)
     root.addWidget(intro)
     root.addLayout(form)
-    root.addWidget(QLabel("UWorld question IDs:"))
+    root.addWidget(ids_label)
     root.addWidget(ids_box)
     root.addWidget(buttons)
 
     if dlg.exec() != QDialog.DialogCode.Accepted:
         return None
-    return payload["ids"], str(payload["mode"])
+    return str(payload["source"]), str(payload["mode"]), list(payload["ids"])
 
 
 def _field_text(note: Any, *names: str) -> str:
@@ -553,7 +599,7 @@ def _inject_nbome_pearls_impl() -> None:
     inject = _show_inject_dialog()
     if inject is None:
         return
-    uw_ids, tag_mode = inject
+    target_source, tag_mode, uw_ids = inject
     cfg = _addon_config()
     custom_prefix = (cfg.get("custom_uworld_tag_prefix") or "").strip()
 
@@ -568,31 +614,58 @@ def _inject_nbome_pearls_impl() -> None:
 
     comlex_level = _comlex_level_from_track(tag_mode, custom_prefix)
 
-    tasks: list[tuple[int, str]] = []
+    note_ids: list[int] = []
     seen: set[int] = set()
-    for uw_id in uw_ids:
+    if target_source == "todays_reviews":
+        scope_tag = _scope_tag_for_due_search(tag_mode, custom_prefix)
+        if not scope_tag:
+            showWarning(
+                "Today's Reviews requires a deck/version scope.\n\n"
+                "Select Step 1/2 v11/v12, or choose Custom and set a custom prefix "
+                "in Add-on Config."
+            )
+            return
+        due_query = f'is:due -is:suspended "tag:{scope_tag}*"'
         try:
-            q = _build_uworld_search_query(uw_id, tag_mode, custom_prefix)
-            nids = mw.col.find_notes(q)
+            nids = mw.col.find_notes(due_query)
         except Exception:
             showWarning(
-                f"Anki could not search your collection for UWorld ID “{uw_id}”.\n\n"
-                "Make sure a deck is open and try again."
+                "Anki could not search due cards right now.\n\n"
+                "Try again after opening your collection."
             )
             return
         for nid in nids:
             if nid not in seen:
                 seen.add(nid)
-                tasks.append((nid, uw_id))
-
-    if not tasks:
-        showInfo(
-            "No matching notes were found for the selected deck/version and those IDs.\n\n"
-            "Try another track in the dropdown, use Legacy mode if your tags differ, "
-            "or set a Custom prefix in Add-on Config to match your hierarchy "
-            "(Browse → copy a full tag from one card)."
-        )
-        return
+                note_ids.append(nid)
+        if not note_ids:
+            showInfo(
+                "No due unsuspended cards were found for that selected deck/version."
+            )
+            return
+    else:
+        for uw_id in uw_ids:
+            try:
+                q = _build_uworld_search_query(uw_id, tag_mode, custom_prefix)
+                nids = mw.col.find_notes(q)
+            except Exception:
+                showWarning(
+                    f"Anki could not search your collection for UWorld ID “{uw_id}”.\n\n"
+                    "Make sure a deck is open and try again."
+                )
+                return
+            for nid in nids:
+                if nid not in seen:
+                    seen.add(nid)
+                    note_ids.append(nid)
+        if not note_ids:
+            showInfo(
+                "No matching notes were found for the selected deck/version and those IDs.\n\n"
+                "Try another track in the dropdown, use Legacy mode if your tags differ, "
+                "or set a Custom prefix in Add-on Config to match your hierarchy "
+                "(Browse → copy a full tag from one card)."
+            )
+            return
 
     today, count_before = _usage_state_for_today()
     enforce_limit, daily_cap = _daily_limit_settings(cfg)
@@ -610,9 +683,9 @@ def _inject_nbome_pearls_impl() -> None:
                 "this add-on cannot read your remaining Google quota."
             )
             return
-        if remaining < len(tasks):
-            original_n = len(tasks)
-            tasks = tasks[:remaining]
+        if remaining < len(note_ids):
+            original_n = len(note_ids)
+            note_ids = note_ids[:remaining]
             showInfo(
                 f"Daily safety cap: you have {remaining} Gemini call(s) left today "
                 f"({count_before} of {daily_cap} already used by this add-on).\n\n"
@@ -622,7 +695,7 @@ def _inject_nbome_pearls_impl() -> None:
             )
 
     mw.progress.start(
-        max=len(tasks),
+        max=len(note_ids),
         min=0,
         label="Injecting NBOME pearls…",
         parent=mw,
@@ -631,17 +704,17 @@ def _inject_nbome_pearls_impl() -> None:
     updated = 0
     errors: list[str] = []
     try:
-        for i, (nid, uw_id) in enumerate(tasks):
+        for i, nid in enumerate(note_ids):
             mw.progress.update(
                 value=i + 1,
-                label=f"NBOME pearls ({i + 1}/{len(tasks)}) — UW {uw_id}",
+                label=f"NBOME pearls ({i + 1}/{len(note_ids)})",
             )
             QApplication.processEvents()
             try:
                 note = mw.col.get_note(nid)
             except Exception:
                 errors.append(
-                    f"UWorld {uw_id}: could not open a matching note (internal error). Skipped."
+                    f"note {nid}: could not open matching note (internal error). Skipped."
                 )
                 continue
 
@@ -649,7 +722,7 @@ def _inject_nbome_pearls_impl() -> None:
                 note[target_field]
             except Exception:
                 errors.append(
-                    f"UWorld {uw_id}: this note has no “{target_field}” field. "
+                    f"note {nid}: this note has no “{target_field}” field. "
                     f"Set “target_field” in Add-on Config or fix the note type. Skipped."
                 )
                 continue
@@ -658,7 +731,7 @@ def _inject_nbome_pearls_impl() -> None:
             back = _field_text(note, "Back Extra", "Back")
             if not (front or back):
                 errors.append(
-                    f"UWorld {uw_id}: no Text/Front or Back Extra/Back content found. Skipped."
+                    f"note {nid}: no Text/Front or Back Extra/Back content found. Skipped."
                 )
                 continue
 
@@ -672,7 +745,7 @@ def _inject_nbome_pearls_impl() -> None:
                     api_key, front, back, comlex_level=comlex_level
                 )
             except Exception as exc:
-                errors.append(f"UWorld {uw_id}: {_friendly_api_one_line(exc)}")
+                errors.append(f"note {nid}: {_friendly_api_one_line(exc)}")
                 continue
 
             safe_pearl = _escape_preserving_b_tags(pearl).replace("\n", "<br>")
@@ -686,7 +759,7 @@ def _inject_nbome_pearls_impl() -> None:
                 mw.col.update_note(note)
             except Exception:
                 errors.append(
-                    f"UWorld {uw_id}: could not save changes to this note. Skipped."
+                    f"note {nid}: could not save changes to this note. Skipped."
                 )
                 continue
             updated += 1

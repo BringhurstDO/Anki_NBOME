@@ -4,5 +4,9 @@
     "limit_daily_gemini_requests": true,
     "daily_gemini_request_cap": 250,
     "anking_uworld_tag_mode": "step2_v12",
-    "custom_uworld_tag_prefix": ""
+    "custom_uworld_tag_prefix": "",
+    "replace_nbome_pearl": false,
+    "run_pearl_injection": true,
+    "forget_matched_cards": false,
+    "unsuspend_matched_cards": false
 }

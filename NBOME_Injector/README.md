@@ -12,7 +12,7 @@ Anki add-on for **COMLEX / NBOME-focused pearls** on top of your UWorld-tagged c
    Open **[Google AI Studio — API keys](https://aistudio.google.com/app/apikey)** (`https://aistudio.google.com/app/apikey`), sign in with Google, click **Create API key**, and copy it. (Same page linked inside the add-on’s **Config** window.)
 
 2. **Paste it into Anki**  
-   In Anki: **Tools → Add-ons** → select **NBOME Pearl Injector** → **Config**. A **settings window** opens (API key, target field, daily limit, optional **custom UWorld tag prefix** for non-standard AnKing paths). Paste your key there and click **OK**.  
+   In Anki: **Tools → Add-ons** → select **NBOME Pearl Injector** → **Config**. You should get the **graphical settings** window (API key, target field, daily limit, custom tag prefix). If Anki shows **raw JSON** instead, fully **restart Anki** after installing/updating the add-on, and confirm the add-on folder name under `addons21` was not renamed (the folder name must match the shipped layout). You can still edit keys in JSON if you prefer.  
    Advanced users can still use **View Files** / `meta.json` if they prefer raw JSON.
 
    **Daily limit (matches Google’s free tier for this model):**  
@@ -28,7 +28,7 @@ Anki add-on for **COMLEX / NBOME-focused pearls** on top of your UWorld-tagged c
    **Maintainers / staying up to date:** There is **no reliable automatic way** for this add-on to pull Google’s live free-tier numbers (Google does not publish a small, stable “free RPD” endpoint meant for third-party clients). When Google changes quotas, update your **Config** `daily_gemini_request_cap` to match, and for a new release bump the defaults in `config.json` and `_DEFAULT_DAILY_CAP` in `__init__.py`. Re-check periodically: bookmark **[Rate limits](https://ai.google.dev/gemini-api/docs/rate-limits)** and your **[AI Studio](https://aistudio.google.com/)** usage.
 
 3. **Run the tool**  
-   **Tools → Inject NBOME Pearls (UWorld IDs)** → choose **deck/version** (Step 1 or 2, v11 or v12 — same idea as UWorld Batch Unsuspend) and choose **Target Source**:  
+   **Tools → Inject NBOME Pearls (UWorld IDs)** → choose **deck/track** (AnKing Step 1, 2, or 3 v12 — same idea as UWorld Batch Unsuspend) and choose **Target Source**:  
    - **UWorld Question IDs (Paste below)**: paste IDs (commas or line breaks), then run.  
    - **Today's Reviews (Due Cards)**: no ID paste needed; pulls `is:due -is:suspended` scoped to your selected deck/version tag.
 
@@ -36,16 +36,19 @@ Anki add-on for **COMLEX / NBOME-focused pearls** on top of your UWorld-tagged c
 
 ## Scope (read this first)
 
-This add-on is **optimized for the common AnKing Step 1 / Step 2 style layout**:
+This add-on is **optimized for the common AnKing Step 1 / Step 2 / Step 3 v12 tag layout**:
 
 - **Card text:** reads from **`Text`** or **`Front`**, and **`Back Extra`** or **`Back`** (in that order).  
-- **Duplicate Shield:** before calling Gemini for a note, the add-on checks whether the target field already contains `NBOME Pearl:`. If it does, that note is skipped (prevents duplicate pearls).
+- **Duplicate shield:** new injections skip notes that already have a pearl from this add-on, or older notes that only contain plain `NBOME Pearl:` text from before replace support (so you don’t stack duplicates). Internally, new pearls are wrapped in hidden delimiters so **Replace** can update only those entries later.
+- **Replace mode:** optional checkbox. If a note already has this add-on’s hidden pearl block, it **updates** that pearl; if not, it **appends a first pearl** (even when `Extra` already has other content). Very old/manual plain `NBOME Pearl:` text is not auto-overwritten.
 - **Universal NBOME Prompt:** Gemini is instructed to act as a **Universal NBOME Expert** and output **1–2** high-yield nuances selected from relevant domains (OMM: viscerosomatics/Chapman/Muscle Energy, Psychiatry: first-line meds + side effects, Ethics/Law: mandatory reporting/Tarasoff/minor consent, Public Health: USPSTF + CDC vaccines).
 - **HTML emphasis only:** Gemini is instructed to **never use Markdown `*` for bold**. For emphasis it must use **HTML `<b>...</b>`** tags, which the add-on preserves for correct rendering on Anki mobile.
-- **Finding cards (default):** for each ID, searches the **exact AnKing hierarchical tag** for the track you pick, e.g. `tag:"#AK_Step2_v12::#UWorld::Step::2857"` (Step 2 + v12 + UWorld ID `2857`). That keeps Step 1 vs Step 2 and v11 vs v12 from mixing.  
+- **Finding cards (default):** Step 1 and Step 2 v12 — for each pasted ID, searches **both** `…#UWorld::Step::<ID>` and `…#UWorld::COMLEX::<ID>` under the selected deck, then merges matches. **Step 3 v12** uses `tag:"#AK_Step3_v12::#UWorld::<ID>"` (no `Step::` / `COMLEX::` segment). Custom prefix mode uses **one** path exactly as you configure. The inject dialog **remembers** your last track until you change it (saved in add-on config); opening **Settings** also keeps that choice. Saved **v11** preset keys from older releases are treated as the matching **v12** track.
+- **QID lookup report (pasted IDs only):** After a run, a **scrollable** summary (modal until you click OK) shows how many **unique** pasted IDs matched at least one note in the **selected deck/track**, and lists IDs with **no** match (wrong deck, typo, missing card, or tag mismatch — not necessarily “COMLEX vs Step”). Duplicate paste lines are merged for search and noted in the report.  
 - **Today's Reviews workflow:** optional mode that processes your due unsuspended cards only, scoped to the selected deck/version tag to avoid unrelated decks.
+- **Forget / unsuspend matched notes:** optional checkboxes in the inject dialog. After the same tag query used for pearls, you can reset **only suspended** matched cards to New (clears intervals/history) and/or unsuspend suspended matched cards. This uses Anki’s scheduler only (no Gemini). Order: forget first, then unsuspend. If you also inject pearls, the daily Gemini cap can still limit how many notes get pearls, but scheduling changes already applied to the full match set. Turn off “Inject NBOME pearls” to run scheduler-only batch updates without an API key.
 - **Legacy mode:** optional **“tag contains ID (any deck)”** — the old broad `tag:*ID*` behavior if you need it.  
-- **Custom prefix:** in **Config**, set **Custom UWorld tag prefix** to the part of the tag **before** the numeric ID (e.g. `#AK_Step2_v12::#UWorld::Step::`), then choose **Custom prefix** in the inject dialog — useful if AnKing renames tags or you use another deck’s hierarchy.
+- **Custom prefix:** in **Config**, set **Custom UWorld tag prefix** to the part of the tag **before** the numeric ID (e.g. `#AK_Step2_v12::#UWorld::Step::` or `#AK_Step3_v12::#UWorld::`), then choose **Custom prefix** in the inject dialog — useful if AnKing renames tags or you use another deck’s hierarchy.
 
 If your deck uses different field names or tag patterns, the add-on may skip notes or find nothing until you align tags/fields or adjust the track / custom prefix.
 

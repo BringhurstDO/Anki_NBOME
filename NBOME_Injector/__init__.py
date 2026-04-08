@@ -46,19 +46,26 @@ _PLACEHOLDER_API_KEY = "PASTE_YOUR_GEMINI_API_KEY_HERE"
 # Direct link to create/copy keys (AI Studio); see https://aistudio.google.com/app/apikey
 _GEMINI_API_KEY_HELP_URL = "https://aistudio.google.com/app/apikey"
 
-# AnKing hierarchical UWorld tags, e.g. tag:#AK_Step2_v12::#UWorld::Step::2857
-_UWORLD_TAG_PRESETS: dict[str, str] = {
-    "step1_v11": "#AK_Step1_v11::#UWorld::Step::",
-    "step1_v12": "#AK_Step1_v12::#UWorld::Step::",
-    "step2_v11": "#AK_Step2_v11::#UWorld::Step::",
-    "step2_v12": "#AK_Step2_v12::#UWorld::Step::",
+# Bound injected pearl HTML so a future run can replace only this block.
+_NBOME_INJECT_START = "<!--NBOME_INJECT_START-->"
+_NBOME_INJECT_END = "<!--NBOME_INJECT_END-->"
+
+# Step 1/2 v12: UWorld ID may appear under #UWorld::Step:: or #UWorld::COMLEX::.
+_UWORLD_TAG_DECK_BASE: dict[str, str] = {
+    "step1_v12": "#AK_Step1_v12::#UWorld::",
+    "step2_v12": "#AK_Step2_v12::#UWorld::",
+}
+
+# Removed v11 presets map to v12 so existing meta.json values keep working in the UI.
+_DEPRECATED_UWORLD_TAG_MODES: dict[str, str] = {
+    "step1_v11": "step1_v12",
+    "step2_v11": "step2_v12",
 }
 
 _INJECT_TRACK_CHOICES: tuple[tuple[str, str], ...] = (
-    ("step1_v11", "Step_1_v11"),
     ("step1_v12", "Step_1_v12"),
-    ("step2_v11", "Step_2_v11"),
     ("step2_v12", "Step_2_v12"),
+    ("step3_v12", "Step_3_v12"),
     ("custom", "Custom prefix (from Add-on Config)"),
     ("legacy_wildcard", "Legacy: tag contains ID (any deck)"),
 )
@@ -69,15 +76,18 @@ _TARGET_SOURCE_CHOICES: tuple[tuple[str, str], ...] = (
 )
 
 _DUE_SCOPE_TAGS: dict[str, str] = {
-    "step1_v11": "#AK_Step1_v11",
     "step1_v12": "#AK_Step1_v12",
-    "step2_v11": "#AK_Step2_v11",
     "step2_v12": "#AK_Step2_v12",
+    "step3_v12": "#AK_Step3_v12",
 }
+
+# Anki’s add-on id is the folder name under addons21. Use it for every addonManager call
+# so getConfig / writeConfig / setConfigAction always agree (avoids falling back to raw JSON Config).
+ADDON_MODULE = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _addon_config() -> dict[str, Any]:
-    cfg = mw.addonManager.getConfig(__name__)
+    cfg = mw.addonManager.getConfig(ADDON_MODULE)
     return cfg if isinstance(cfg, dict) else {}
 
 
@@ -97,9 +107,14 @@ def _merged_ui_config() -> dict[str, Any]:
         cap = _DEFAULT_DAILY_CAP
     custom_pf = (raw.get("custom_uworld_tag_prefix") or "").strip()
     mode = (raw.get("anking_uworld_tag_mode") or "step2_v12").strip()
+    mode = _DEPRECATED_UWORLD_TAG_MODES.get(mode, mode)
     valid_modes = {k for k, _ in _INJECT_TRACK_CHOICES}
     if mode not in valid_modes:
         mode = "step2_v12"
+    replace_pearl = _coerce_bool(raw.get("replace_nbome_pearl"), False)
+    run_pearl = _coerce_bool(raw.get("run_pearl_injection"), True)
+    forget_matched = _coerce_bool(raw.get("forget_matched_cards"), False)
+    unsuspend_matched = _coerce_bool(raw.get("unsuspend_matched_cards"), False)
     return {
         "api_key": api,
         "target_field": tf,
@@ -107,17 +122,22 @@ def _merged_ui_config() -> dict[str, Any]:
         "daily_gemini_request_cap": cap,
         "custom_uworld_tag_prefix": custom_pf,
         "anking_uworld_tag_mode": mode,
+        "replace_nbome_pearl": replace_pearl,
+        "run_pearl_injection": run_pearl,
+        "forget_matched_cards": forget_matched,
+        "unsuspend_matched_cards": unsuspend_matched,
     }
 
 
-def _show_config_dialog() -> None:
+def _show_config_dialog() -> bool:
+    """Return True so Anki does not fall through to the raw JSON Config editor."""
     initial = _merged_ui_config()
     dlg = QDialog(mw)
     dlg.setWindowTitle("NBOME Pearl Injector — Settings")
     dlg.setMinimumWidth(500)
 
     api_header = QLabel(
-        "<b>Gemini API key (required)</b><br>"
+        "<b>Gemini API key</b> (required only if you inject pearls)<br>"
         "This add-on uses <i>your</i> key (Bring Your Own Key). If you have not created one before:"
     )
     api_header.setWordWrap(True)
@@ -173,7 +193,7 @@ def _show_config_dialog() -> None:
     custom_prefix_edit = QLineEdit(dlg)
     custom_prefix_edit.setText(initial["custom_uworld_tag_prefix"])
     custom_prefix_edit.setPlaceholderText(
-        "e.g. #AK_Step2_v12::#UWorld::Step::   (no ID at the end)"
+        "e.g. #AK_Step2_v12::#UWorld::Step:: or …::COMLEX::   (no ID at the end)"
     )
     prefix_hint = QLabel(
         "Used when the inject dialog is set to “Custom prefix”. Must match your deck’s "
@@ -204,7 +224,7 @@ def _show_config_dialog() -> None:
     root.addWidget(buttons)
 
     if dlg.exec() != QDialog.DialogCode.Accepted:
-        return
+        return True
 
     key = api_edit.text().strip()
     new_cfg = dict(_addon_config())
@@ -215,9 +235,29 @@ def _show_config_dialog() -> None:
             "limit_daily_gemini_requests": bool(limit_cb.isChecked()),
             "daily_gemini_request_cap": int(cap_spin.value()),
             "custom_uworld_tag_prefix": custom_prefix_edit.text().strip(),
+            # Preserve inject dialog choices; writeConfig may replace stored JSON.
+            "anking_uworld_tag_mode": initial["anking_uworld_tag_mode"],
+            "replace_nbome_pearl": initial["replace_nbome_pearl"],
+            "run_pearl_injection": initial["run_pearl_injection"],
+            "forget_matched_cards": initial["forget_matched_cards"],
+            "unsuspend_matched_cards": initial["unsuspend_matched_cards"],
         }
     )
-    mw.addonManager.writeConfig(__name__, new_cfg)
+    mw.addonManager.writeConfig(ADDON_MODULE, new_cfg)
+    return True
+
+
+def _register_nbome_config_ui(_addons_dialog: Any = None) -> None:
+    """Bind the graphical Config handler to this add-on’s folder id (and Python module root)."""
+    try:
+        mgr = mw.addonManager
+        mgr.setConfigAction(ADDON_MODULE, _show_config_dialog)
+        # If Anki loaded this file under a dotted module name, first segment must match dir_name.
+        mod_root = __name__.split(".", 1)[0]
+        if mod_root != ADDON_MODULE:
+            mgr.setConfigAction(mod_root, _show_config_dialog)
+    except Exception:
+        pass
 
 
 def _sanitize_user_detail(text: str) -> str:
@@ -335,36 +375,193 @@ def _parse_uworld_ids(raw: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+# Max IDs listed under "No note found for:" in completion dialogs (rest summarized).
+_QID_REPORT_MAX_UNMATCHED_LINES = 100
+
+
+def _qid_match_report(
+    *,
+    total_unique: int,
+    matched_count: int,
+    unmatched: list[str],
+    duplicate_lines_in_paste: int,
+) -> str:
+    """Summary for pasted-question-ID runs: match count + list of IDs with zero notes."""
+    lines = [
+        "",
+        "Pasted question IDs",
+        f"Found at least one note for {matched_count} of {total_unique} unique ID(s).",
+    ]
+    if duplicate_lines_in_paste > 0:
+        lines.append(
+            f"({duplicate_lines_in_paste} duplicate line(s) in the paste were skipped; "
+            "search used unique IDs only.)"
+        )
+    if unmatched:
+        lines.append("")
+        lines.append(
+            "No note matched these IDs for the deck/version you picked — e.g. wrong deck, "
+            "typo, card not in this profile, or ID not tagged the way this search expects:"
+        )
+        cap = _QID_REPORT_MAX_UNMATCHED_LINES
+        for u in unmatched[:cap]:
+            lines.append(f"  {u}")
+        if len(unmatched) > cap:
+            lines.append(f"  … and {len(unmatched) - cap} more.")
+    return "\n".join(lines)
+
+
+def _present_nbome_outcome(
+    summary: str,
+    qid_report: str,
+    *,
+    as_warning: bool,
+    append_attribution: bool = False,
+) -> None:
+    """Show summary; if there is a QID report, use a scrollable modal so it is not auto-dismissed."""
+    qr = (qid_report or "").strip()
+    att = _SUCCESS_ATTRIBUTION if append_attribution else ""
+    fallback = summary.rstrip()
+    if att:
+        fallback = f"{fallback}{att}"
+
+    if not qr:
+        if as_warning:
+            showWarning(fallback)
+        else:
+            showInfo(fallback)
+        return
+
+    dlg = QDialog(mw)
+    dlg.setWindowTitle(
+        "NBOME Pearl Injector — Attention"
+        if as_warning
+        else "NBOME Pearl Injector — Results"
+    )
+    dlg.setMinimumWidth(560)
+    dlg.setMinimumHeight(320)
+    root = QVBoxLayout(dlg)
+    sum_lbl = QLabel(summary.strip())
+    sum_lbl.setWordWrap(True)
+    sum_lbl.setTextInteractionFlags(
+        Qt.TextInteractionFlag.TextSelectableByMouse
+        | Qt.TextInteractionFlag.TextSelectableByKeyboard
+    )
+    root.addWidget(sum_lbl)
+    root.addWidget(
+        QLabel("ID lookup details (scroll; Ctrl+A to select all, then copy):")
+    )
+    te = QPlainTextEdit(qr)
+    te.setReadOnly(True)
+    te.setMinimumHeight(260)
+    root.addWidget(te)
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+    qconnect(buttons.accepted, dlg.accept)
+    root.addWidget(buttons)
+    if att.strip():
+        att_lbl = QLabel(att.strip())
+        att_lbl.setWordWrap(True)
+        att_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        root.addWidget(att_lbl)
+    dlg.exec()
+
+
+def _nbome_pearl_block_inner_html(safe_pearl: str) -> str:
+    """HTML inside marker comments (header + pearl body)."""
+    return (
+        "<b style='color:#007BFF;'>NBOME Pearl:</b><br>"
+        f"{safe_pearl}"
+    )
+
+
+def _nbome_pearl_wrapped_block(safe_pearl: str) -> str:
+    """Full replaceable block (markers + visible pearl)."""
+    return (
+        f"{_NBOME_INJECT_START}"
+        f"{_nbome_pearl_block_inner_html(safe_pearl)}"
+        f"{_NBOME_INJECT_END}"
+    )
+
+
+def _field_has_valid_nbome_marker_block(field: str) -> bool:
+    """True if <!--NBOME_INJECT_START-->…<!--NBOME_INJECT_END--> appears in order."""
+    cur = str(field or "")
+    if _NBOME_INJECT_START not in cur or _NBOME_INJECT_END not in cur:
+        return False
+    idx_s = cur.find(_NBOME_INJECT_START)
+    idx_e = cur.find(_NBOME_INJECT_END, idx_s + len(_NBOME_INJECT_START))
+    return idx_s >= 0 and idx_e > idx_s
+
+
+def _apply_nbome_pearl_to_field(
+    current: str,
+    safe_pearl: str,
+    *,
+    replace_existing: bool,
+) -> tuple[str | None, str | None]:
+    """Return (new_field, None) on success; (None, skip_reason) to skip without API."""
+    cur = str(current or "")
+    block = _nbome_pearl_wrapped_block(safe_pearl)
+
+    if replace_existing:
+        if _field_has_valid_nbome_marker_block(cur):
+            idx_s = cur.find(_NBOME_INJECT_START)
+            idx_e = cur.find(_NBOME_INJECT_END, idx_s + len(_NBOME_INJECT_START))
+            if idx_s < 0 or idx_e < 0 or idx_e <= idx_s:
+                return None, "bad_marker_order"
+            new_field = cur[:idx_s] + block + cur[idx_e + len(_NBOME_INJECT_END) :]
+            return new_field, None
+        if "NBOME Pearl:" in cur:
+            return None, "legacy_pearl"
+        if _NBOME_INJECT_START in cur or _NBOME_INJECT_END in cur:
+            return None, "invalid_marker_block"
+        return cur + "<br><br>" + block, None
+
+    if _NBOME_INJECT_START in cur:
+        return None, "already_has_markers"
+    if "NBOME Pearl:" in cur:
+        return None, "legacy_pearl"
+    return cur + "<br><br>" + block, None
+
+
 def _format_quoted_tag_search(full_tag: str) -> str:
     """Exact hierarchical tag search; quoted so #, ::, etc. are literal."""
     escaped = full_tag.replace("\\", "\\\\").replace('"', '\\"')
     return f'tag:"{escaped}"'
 
 
-def _build_uworld_search_query(uw_id: str, mode: str, custom_prefix: str) -> str:
+def _build_uworld_search_queries(uw_id: str, mode: str, custom_prefix: str) -> list[str]:
     if mode == "legacy_wildcard":
-        return f"tag:*{uw_id}*"
+        return [f"tag:*{uw_id}*"]
     if mode == "custom":
         p = (custom_prefix or "").strip()
-        full = f"{p}{uw_id}"
-        return _format_quoted_tag_search(full)
-    prefix = _UWORLD_TAG_PRESETS.get(mode) or _UWORLD_TAG_PRESETS["step2_v12"]
-    full = f"{prefix}{uw_id}"
-    return _format_quoted_tag_search(full)
+        return [_format_quoted_tag_search(f"{p}{uw_id}")]
+    if mode == "step3_v12":
+        # AnKing Step 3 v12: e.g. #AK_Step3_v12::#UWorld::10008 (no Step:: / COMLEX:: segment).
+        return [_format_quoted_tag_search(f"#AK_Step3_v12::#UWorld::{uw_id}")]
+    base = _UWORLD_TAG_DECK_BASE.get(mode) or _UWORLD_TAG_DECK_BASE["step2_v12"]
+    return [
+        _format_quoted_tag_search(f"{base}Step::{uw_id}"),
+        _format_quoted_tag_search(f"{base}COMLEX::{uw_id}"),
+    ]
 
 
 def _comlex_level_from_track(mode: str, custom_prefix: str) -> int:
-    """1 = COMLEX Level 1 (Step 1 deck), 2 = COMLEX Level 2 (Step 2 deck)."""
+    """COMLEX level aligned with AnKing Step 1 / 2 / 3 deck tracks."""
     if mode.startswith("step1_"):
         return 1
     if mode.startswith("step2_"):
         return 2
+    if mode.startswith("step3_"):
+        return 3
     if mode == "custom":
         p = custom_prefix or ""
         if re.search(r"#AK_Step1|_Step1_|Step1_v", p, re.IGNORECASE):
             return 1
         if re.search(r"#AK_Step2|_Step2_|Step2_v", p, re.IGNORECASE):
             return 2
+        if re.search(r"#AK_Step3|_Step3_|Step3_v", p, re.IGNORECASE):
+            return 3
         return 2
     return 2
 
@@ -383,16 +580,22 @@ def _scope_tag_for_due_search(mode: str, custom_prefix: str) -> str | None:
     return None
 
 
-def _show_inject_dialog() -> tuple[str, str, list[str]] | None:
+def _show_inject_dialog() -> dict[str, Any] | None:
     merged = _merged_ui_config()
     dlg = QDialog(mw)
     dlg.setWindowTitle("NBOME Pearl Injector")
-    dlg.setMinimumWidth(500)
-    dlg.setMinimumHeight(360)
+    dlg.setMinimumWidth(520)
+    dlg.setMinimumHeight(420)
 
     intro = QLabel(
-        "Pick the AnKing track that matches your card tags (same deck/version as in "
-        "UWorld Batch Unsuspend). Only notes under that tag path are included."
+        "1) Choose the deck/version that matches your AnKing tags (same idea as other UWorld "
+        "batch tools). Your choice is saved.\n\n"
+        "2) Paste question IDs below, or switch Target Source to Today’s Reviews.\n\n"
+        "3) Turn on what you want: new pearls (Gemini), replace old pearls, forget scheduling, "
+        "and/or unsuspend.\n\n"
+        "Forget and unsuspend run on every note that matches. Forget is not offered for "
+        "Today’s Reviews (it would reset scheduling for your entire due set in that scope). "
+        "New pearls need an API key in Config and may stop when your daily Gemini limit is reached."
     )
     intro.setWordWrap(True)
 
@@ -414,6 +617,27 @@ def _show_inject_dialog() -> tuple[str, str, list[str]] | None:
     ids_box.setPlaceholderText("UWorld IDs — comma or line separated")
     ids_label = QLabel("UWorld question IDs:")
 
+    pearl_cb = QCheckBox("Add / generate NBOME pearls with Gemini (API key in Config)")
+    pearl_cb.setChecked(bool(merged.get("run_pearl_injection", True)))
+
+    replace_cb = QCheckBox(
+        "Update existing add-on pearls; if none exists yet, append a first pearl"
+    )
+    replace_cb.setChecked(bool(merged.get("replace_nbome_pearl")))
+
+    forget_cb = QCheckBox(
+        "Forget matched cards — reset all cards of each matched note to New "
+        "(clears intervals/history)"
+    )
+    forget_cb.setChecked(bool(merged.get("forget_matched_cards")))
+
+    unsuspend_cb = QCheckBox(
+        "Unsuspend matched cards (activates suspended cards from the same notes)"
+    )
+    unsuspend_cb.setChecked(bool(merged.get("unsuspend_matched_cards")))
+
+    ids_mode_forget_pref: list[bool] = [bool(merged.get("forget_matched_cards"))]
+
     form = QFormLayout()
     form.addRow("Deck / version:", track)
     form.addRow("Target Source:", source)
@@ -424,8 +648,36 @@ def _show_inject_dialog() -> tuple[str, str, list[str]] | None:
         ids_box.setVisible(use_ids)
         ids_label.setVisible(use_ids)
 
+        is_due = str(source.currentData()) == "todays_reviews"
+        if is_due:
+            if forget_cb.isEnabled():
+                ids_mode_forget_pref[0] = bool(forget_cb.isChecked())
+            forget_cb.setEnabled(False)
+            forget_cb.setChecked(False)
+            forget_cb.setToolTip(
+                "Not available for Today’s Reviews: forgetting would reset every card on each "
+                "due note in this deck/version scope and wipe out your review queue."
+            )
+        else:
+            forget_cb.setEnabled(True)
+            forget_cb.setChecked(ids_mode_forget_pref[0])
+            forget_cb.setToolTip("")
+
+    def _on_forget_toggled(checked: bool) -> None:
+        if str(source.currentData()) == "uworld_ids":
+            ids_mode_forget_pref[0] = bool(checked)
+
+    def _sync_pearl_dependents() -> None:
+        en = pearl_cb.isChecked()
+        replace_cb.setEnabled(en)
+        if not en:
+            replace_cb.setChecked(False)
+
     qconnect(source.currentIndexChanged, lambda _idx: _sync_source_ui())
+    qconnect(forget_cb.toggled, _on_forget_toggled)
+    qconnect(pearl_cb.toggled, lambda _c: _sync_pearl_dependents())
     _sync_source_ui()
+    _sync_pearl_dependents()
 
     buttons = QDialogButtonBox(
         QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -443,12 +695,30 @@ def _show_inject_dialog() -> tuple[str, str, list[str]] | None:
                 showWarning("Enter at least one UWorld question ID.")
                 return
         mode = str(track.currentData())
+        run_pearl = bool(pearl_cb.isChecked())
+        rep = bool(replace_cb.isChecked()) and run_pearl
+        forget_m = src == "uworld_ids" and bool(forget_cb.isChecked())
+        unsuspend_m = bool(unsuspend_cb.isChecked())
+        if not run_pearl and not forget_m and not unsuspend_m:
+            showWarning(
+                "Choose at least one action: inject pearls, forget matched cards, "
+                "and/or unsuspend matched cards."
+            )
+            return
         payload["source"] = src
         payload["ids"] = uw_ids
         payload["mode"] = mode
+        payload["replace_pearl"] = rep
+        payload["run_pearl_injection"] = run_pearl
+        payload["forget_matched_cards"] = forget_m
+        payload["unsuspend_matched_cards"] = unsuspend_m
         new_c = dict(_addon_config())
         new_c["anking_uworld_tag_mode"] = mode
-        mw.addonManager.writeConfig(__name__, new_c)
+        new_c["replace_nbome_pearl"] = bool(replace_cb.isChecked())
+        new_c["run_pearl_injection"] = run_pearl
+        new_c["forget_matched_cards"] = ids_mode_forget_pref[0]
+        new_c["unsuspend_matched_cards"] = unsuspend_m
+        mw.addonManager.writeConfig(ADDON_MODULE, new_c)
         dlg.accept()
 
     qconnect(buttons.accepted, _on_ok)
@@ -456,13 +726,25 @@ def _show_inject_dialog() -> tuple[str, str, list[str]] | None:
     root = QVBoxLayout(dlg)
     root.addWidget(intro)
     root.addLayout(form)
+    root.addWidget(pearl_cb)
+    root.addWidget(replace_cb)
+    root.addWidget(forget_cb)
+    root.addWidget(unsuspend_cb)
     root.addWidget(ids_label)
     root.addWidget(ids_box)
     root.addWidget(buttons)
 
     if dlg.exec() != QDialog.DialogCode.Accepted:
         return None
-    return str(payload["source"]), str(payload["mode"]), list(payload["ids"])
+    return {
+        "source": str(payload["source"]),
+        "mode": str(payload["mode"]),
+        "ids": list(payload["ids"]),
+        "replace_pearl": bool(payload.get("replace_pearl")),
+        "run_pearl_injection": bool(payload.get("run_pearl_injection")),
+        "forget_matched_cards": bool(payload.get("forget_matched_cards")),
+        "unsuspend_matched_cards": bool(payload.get("unsuspend_matched_cards")),
+    }
 
 
 def _field_text(note: Any, *names: str) -> str:
@@ -479,6 +761,118 @@ def _field_text(note: Any, *names: str) -> str:
     return ""
 
 
+def _card_ids_for_note_ids(col: Any, nids: list[int]) -> list[int]:
+    """All card IDs for the given notes, stable order, no duplicates."""
+    ordered: list[int] = []
+    seen: set[int] = set()
+    for nid in nids:
+        try:
+            note = col.get_note(nid)
+            try:
+                raw = note.card_ids()
+            except AttributeError:
+                db = col.db
+                if db is None:
+                    continue
+                raw = db.list("select id from cards where nid = ?", nid)
+        except Exception:
+            continue
+        for cid in raw:
+            if cid not in seen:
+                seen.add(cid)
+                ordered.append(cid)
+    return ordered
+
+
+def _partition_suspended_card_ids(col: Any, cids: list[int]) -> tuple[list[int], list[int]]:
+    """Return (suspended, non_suspended) for given card ids."""
+    suspended: list[int] = []
+    non_suspended: list[int] = []
+    for cid in cids:
+        try:
+            card = col.get_card(cid)
+            if int(getattr(card, "queue", 0)) == -1:
+                suspended.append(cid)
+            else:
+                non_suspended.append(cid)
+        except Exception:
+            # Be conservative: unknown status should not be reset by Forget.
+            non_suspended.append(cid)
+    return suspended, non_suspended
+
+
+def _scheduler_reset_cards_new(col: Any, cids: list[int]) -> None:
+    """Move cards to the New queue and clear review history (Forget)."""
+    if not cids:
+        return
+    sched = col.sched
+    if hasattr(sched, "schedule_cards_as_new"):
+        try:
+            sched.schedule_cards_as_new(cids, reset_counts=True)
+        except TypeError:
+            sched.schedule_cards_as_new(cids)
+        return
+    if hasattr(sched, "forgetCards"):
+        sched.forgetCards(cids)
+        return
+    if hasattr(sched, "forget_cards"):
+        sched.forget_cards(cids)
+        return
+    raise RuntimeError(
+        "This Anki build has no supported API to reset cards (schedule_cards_as_new / forgetCards)."
+    )
+
+
+def _scheduler_unsuspend_cards(col: Any, cids: list[int]) -> None:
+    if not cids:
+        return
+    sched = col.sched
+    if hasattr(sched, "unsuspend_cards"):
+        sched.unsuspend_cards(cids)
+        return
+    if hasattr(sched, "unsuspendCards"):
+        sched.unsuspendCards(cids)
+        return
+    raise RuntimeError(
+        "This Anki build has no supported API to unsuspend cards (unsuspend_cards)."
+    )
+
+
+def _scheduler_forget_then_unsuspend(
+    col: Any,
+    *,
+    forget_cids: list[int],
+    unsuspend_cids: list[int],
+    do_forget: bool,
+    do_unsuspend: bool,
+) -> None:
+    """Forget only suspended cards, then unsuspend selected cards."""
+    if (not do_forget and not do_unsuspend) or (not forget_cids and not unsuspend_cids):
+        return
+    if do_forget and forget_cids:
+        _scheduler_reset_cards_new(col, forget_cids)
+    if do_unsuspend and unsuspend_cids:
+        _scheduler_unsuspend_cards(col, unsuspend_cids)
+
+
+def _scheduler_summary_line(
+    *,
+    did_forget: bool,
+    forgot_count: int,
+    did_unsuspend: bool,
+    unsuspended_count: int,
+    matched_notes_count: int,
+) -> str:
+    parts: list[str] = []
+    if did_forget:
+        parts.append(f"reset to New for {forgot_count} suspended card(s)")
+    if did_unsuspend:
+        parts.append(f"unsuspended {unsuspended_count} card(s)")
+    return (
+        f"Scheduling: {'; '.join(parts)} from {matched_notes_count} matched note(s)."
+    )
+
+
 def _call_gemini(
     api_key: str, front: str, back: str, *, comlex_level: int
 ) -> str:
@@ -487,13 +881,30 @@ def _call_gemini(
     # - Use HTML <b> tags for emphasis only (no Markdown asterisks).
     prompt = (
         f"Act as a Universal NBOME Expert and COMLEX Level {comlex_level} tutor.\n"
+        "NBOME / COMLEX alignment (apply without adding extra preface in your answer):\n"
+        "- Prioritize pearls that fit COMLEX item style, including OPP/OMT integration when the flashcard is "
+        "clinical or clearly musculoskeletal / neurovisceral. Do not force OMT or viscerosomatic detail "
+        "when the card is unrelated.\n"
+        "- Silently use the COMLEX-USA Master Blueprint mindset (competency domains—especially osteopathic "
+        "principles and practice—and clinical presentations) only to steer relevance; do not name or list "
+        "blueprint categories in your output.\n"
+        "- For OMM and viscerosomatic-type content, use concise, board-style phrasing (testable mechanism + "
+        "classic buzzwords where helpful). Do not claim verbatim quotes, editions, or citations you cannot verify.\n"
+        "- When management or “next step” could differ between typical USMLE-style aggressiveness and the more "
+        "conservative or OMT-inclusive patterns often emphasized in osteopathic training, prefer the latter "
+        "only when it matches well-established teaching; if uncertain, give a cautious, conditional pearl or omit.\n"
+        "- Never invent AOA/NBOME document titles, guideline years, or “per [source]” specifics.\n\n"
         "Read the following medical flashcard.\n"
         "Provide 1-2 highly tested NBOME nuances that best match the flashcard content.\n"
         "Select the most relevant nuance(s) from these domains when applicable:\n"
         "1) OMM: viscerosomatics, Chapman points, and Muscle Energy.\n"
         "2) Psychiatry: NBOME-preferred first-line meds and specific side effects; include geriatric warnings (e.g., avoid X in elderly) when relevant.\n"
         "3) Ethics/Law: mandatory reporting (abuse, wounds), Tarasoff duty, and minor consent when relevant.\n"
-        "4) Public Health: USPSTF screening and CDC vaccine schedules when relevant.\n\n"
+        "4) Public Health: USPSTF screening and CDC vaccine schedules when relevant.\n"
+        "If the card lists many drugs or parallel first-line options, output one tight sentence "
+        "with the single highest-yield NBOME discriminator (who gets which first-line, or the "
+        "key contraindication that rules out an option); do not mirror every cloze blank or "
+        "enumerate every drug.\n\n"
         "Formatting rules:\n"
         "- Output ONLY the raw text to be added to the flashcard.\n"
         "- NEVER use Markdown asterisks (*) for bolding.\n"
@@ -564,15 +975,24 @@ def _call_gemini(
 def _inject_nbome_pearls() -> None:
     try:
         _inject_nbome_pearls_impl()
-    except Exception:
+    except Exception as exc:
         try:
             mw.progress.finish()
         except Exception:
             pass
+        try:
+            import traceback
+
+            print("NBOME Pearl Injector — traceback:\n", traceback.format_exc())
+        except Exception:
+            pass
+        detail = _sanitize_user_detail(str(exc)) if exc else ""
+        extra = f"\n\nDetails: {detail}" if detail else ""
         showWarning(
-            "NBOME Pearl Injector ran into an unexpected problem.\n\n"
-            "Please restart Anki and try again. If it keeps happening, "
-            "report the issue with your Anki version and add-on version."
+            "NBOME Pearl Injector ran into an unexpected problem."
+            f"{extra}\n\n"
+            "Try again after a full Anki restart. If it keeps happening, report the "
+            "message above with your Anki version and add-on version (Help → About)."
         )
 
 
@@ -583,24 +1003,34 @@ def _inject_nbome_pearls_impl() -> None:
         )
         return
 
-    cfg = _addon_config()
-    api_key = (cfg.get("api_key") or "").strip()
-    if not api_key or api_key == _PLACEHOLDER_API_KEY:
-        showWarning(
-            "Add your own Gemini API key first.\n\n"
-            "Tools → Add-ons → NBOME Pearl Injector → Config → paste your key.\n\n"
-            "Get a free key at Google AI Studio. Your key stays on your computer; "
-            "the author does not provide or pay for API usage."
-        )
-        return
-
-    target_field = (cfg.get("target_field") or "Extra").strip() or "Extra"
-
     inject = _show_inject_dialog()
     if inject is None:
         return
-    target_source, tag_mode, uw_ids = inject
+
+    run_pearl = bool(inject["run_pearl_injection"])
+    replace_pearl = bool(inject["replace_pearl"])
+    forget_matched = bool(inject["forget_matched_cards"])
+    unsuspend_matched = bool(inject["unsuspend_matched_cards"])
+    target_source = str(inject["source"])
+    if target_source == "todays_reviews":
+        forget_matched = False
+    tag_mode = str(inject["mode"])
+    uw_ids = list(inject["ids"])
+
     cfg = _addon_config()
+    api_key = (cfg.get("api_key") or "").strip()
+    if run_pearl:
+        if not api_key or api_key == _PLACEHOLDER_API_KEY:
+            showWarning(
+                "Add your own Gemini API key first.\n\n"
+                "Tools → Add-ons → NBOME Pearl Injector → Config → paste your key.\n\n"
+                "Or turn off “Inject NBOME pearls” and use only forget/unsuspend.\n\n"
+                "Get a free key at Google AI Studio. Your key stays on your computer; "
+                "the author does not provide or pay for API usage."
+            )
+            return
+
+    target_field = (cfg.get("target_field") or "Extra").strip() or "Extra"
     custom_prefix = (cfg.get("custom_uworld_tag_prefix") or "").strip()
 
     if tag_mode == "custom" and not custom_prefix:
@@ -608,20 +1038,21 @@ def _inject_nbome_pearls_impl() -> None:
             "Custom tag prefix is empty.\n\n"
             "Open Add-on Config and set “Custom UWorld tag prefix” "
             "(everything before the numeric ID, e.g. #AK_Step2_v12::#UWorld::Step::), "
-            "or choose Step_1 / Step_2 and v11 / v12 above."
+            "or choose Step_1 / Step_2 / Step_3 v12 above."
         )
         return
 
     comlex_level = _comlex_level_from_track(tag_mode, custom_prefix)
 
-    note_ids: list[int] = []
+    note_ids_all: list[int] = []
     seen: set[int] = set()
+    qid_report = ""
     if target_source == "todays_reviews":
         scope_tag = _scope_tag_for_due_search(tag_mode, custom_prefix)
         if not scope_tag:
             showWarning(
                 "Today's Reviews requires a deck/version scope.\n\n"
-                "Select Step 1/2 v11/v12, or choose Custom and set a custom prefix "
+                "Select Step 1/2/3 v12, or choose Custom and set a custom prefix "
                 "in Add-on Config."
             )
             return
@@ -637,134 +1068,236 @@ def _inject_nbome_pearls_impl() -> None:
         for nid in nids:
             if nid not in seen:
                 seen.add(nid)
-                note_ids.append(nid)
-        if not note_ids:
+                note_ids_all.append(nid)
+        if not note_ids_all:
             showInfo(
                 "No due unsuspended cards were found for that selected deck/version."
             )
             return
     else:
-        for uw_id in uw_ids:
-            try:
-                q = _build_uworld_search_query(uw_id, tag_mode, custom_prefix)
-                nids = mw.col.find_notes(q)
-            except Exception:
-                showWarning(
-                    f"Anki could not search your collection for UWorld ID “{uw_id}”.\n\n"
-                    "Make sure a deck is open and try again."
-                )
-                return
-            for nid in nids:
-                if nid not in seen:
-                    seen.add(nid)
-                    note_ids.append(nid)
-        if not note_ids:
-            showInfo(
+        uw_unique = list(dict.fromkeys(uw_ids))
+        duplicate_lines = max(0, len(uw_ids) - len(uw_unique))
+        matched_qids: set[str] = set()
+        for uw_id in uw_unique:
+            id_matched = False
+            for q in _build_uworld_search_queries(uw_id, tag_mode, custom_prefix):
+                try:
+                    nids = mw.col.find_notes(q)
+                except Exception:
+                    showWarning(
+                        f"Anki could not search your collection for UWorld ID “{uw_id}”.\n\n"
+                        "Make sure a deck is open and try again."
+                    )
+                    return
+                if nids:
+                    id_matched = True
+                for nid in nids:
+                    if nid not in seen:
+                        seen.add(nid)
+                        note_ids_all.append(nid)
+            if id_matched:
+                matched_qids.add(uw_id)
+        unmatched_qids = [u for u in uw_unique if u not in matched_qids]
+        qid_report = _qid_match_report(
+            total_unique=len(uw_unique),
+            matched_count=len(matched_qids),
+            unmatched=unmatched_qids,
+            duplicate_lines_in_paste=duplicate_lines,
+        )
+        if not note_ids_all:
+            _present_nbome_outcome(
                 "No matching notes were found for the selected deck/version and those IDs.\n\n"
                 "Try another track in the dropdown, use Legacy mode if your tags differ, "
                 "or set a Custom prefix in Add-on Config to match your hierarchy "
-                "(Browse → copy a full tag from one card)."
+                "(Browse → copy a full tag from one card).",
+                qid_report,
+                as_warning=False,
+            )
+            return
+
+    scheduler_done = False
+    scheduler_cards = 0
+    scheduler_summary = ""
+    if forget_matched or unsuspend_matched:
+        try:
+            cids_all = _card_ids_for_note_ids(mw.col, note_ids_all)
+            scheduler_cards = len(cids_all)
+            if scheduler_cards == 0:
+                _present_nbome_outcome(
+                    "Forget/unsuspend was requested, but no cards were found for the "
+                    "matched notes.",
+                    qid_report,
+                    as_warning=True,
+                )
+                return
+            suspended_cids, _non_suspended = _partition_suspended_card_ids(
+                mw.col, cids_all
+            )
+            forget_cids = suspended_cids if forget_matched else []
+            unsuspend_cids = suspended_cids if unsuspend_matched else []
+            _scheduler_forget_then_unsuspend(
+                mw.col,
+                forget_cids=forget_cids,
+                unsuspend_cids=unsuspend_cids,
+                do_forget=forget_matched,
+                do_unsuspend=unsuspend_matched,
+            )
+            scheduler_done = True
+            scheduler_summary = _scheduler_summary_line(
+                did_forget=forget_matched,
+                forgot_count=len(forget_cids),
+                did_unsuspend=unsuspend_matched,
+                unsuspended_count=len(unsuspend_cids),
+                matched_notes_count=len(note_ids_all),
+            )
+            mw.reset()
+        except Exception as exc:
+            _present_nbome_outcome(
+                "Could not update scheduling for matched cards.\n\n"
+                f"{_sanitize_user_detail(str(exc))}",
+                qid_report,
+                as_warning=True,
             )
             return
 
     today, count_before = _usage_state_for_today()
     enforce_limit, daily_cap = _daily_limit_settings(cfg)
 
-    if enforce_limit and daily_cap >= 1:
-        remaining = daily_cap - count_before
-        if remaining <= 0:
-            showWarning(
-                f"You have reached today’s local safety cap ({daily_cap} successful "
-                f"Gemini calls tracked by this add-on).\n\n"
-                "It resets at midnight on this computer’s local date, or you can change "
-                "Add-on Config: set `limit_daily_gemini_requests` to false if you accept "
-                "possible Google charges, or raise `daily_gemini_request_cap`.\n\n"
-                "Google’s real free tier and billing are shown only in Google AI Studio—"
-                "this add-on cannot read your remaining Google quota."
-            )
-            return
-        if remaining < len(note_ids):
-            original_n = len(note_ids)
-            note_ids = note_ids[:remaining]
-            showInfo(
-                f"Daily safety cap: you have {remaining} Gemini call(s) left today "
-                f"({count_before} of {daily_cap} already used by this add-on).\n\n"
-                f"This batch had {original_n} note(s); only the first {remaining} will be processed.\n\n"
-                "To process more today, raise `daily_gemini_request_cap` or set "
-                "`limit_daily_gemini_requests` to false (see README)."
-            )
+    pearl_cap_notice = ""
+    note_ids_for_pearl: list[int] = list(note_ids_all)
+    if run_pearl:
+        if enforce_limit and daily_cap >= 1:
+            remaining = daily_cap - count_before
+            if remaining <= 0:
+                cap_msg = (
+                    f"You have reached today’s local safety cap ({daily_cap} successful "
+                    f"Gemini calls tracked by this add-on).\n\n"
+                    "It resets at midnight on this computer’s local date, or you can change "
+                    "Add-on Config: set `limit_daily_gemini_requests` to false if you accept "
+                    "possible Google charges, or raise `daily_gemini_request_cap`.\n\n"
+                    "Google’s real free tier and billing are shown only in Google AI Studio—"
+                    "this add-on cannot read your remaining Google quota."
+                )
+                if scheduler_done:
+                    cap_msg += (
+                        "\n\nScheduling changes above were applied; pearl injection was not run."
+                    )
+                _present_nbome_outcome(cap_msg.strip(), qid_report, as_warning=True)
+                return
+            if remaining < len(note_ids_for_pearl):
+                original_n = len(note_ids_for_pearl)
+                note_ids_for_pearl = note_ids_for_pearl[:remaining]
+                pearl_cap_notice = (
+                    f"Note: Your daily Gemini cap allowed pearl injection for only "
+                    f"{remaining} of {original_n} note(s) in this batch. "
+                    f"(Forget/unsuspend, if used, still applied to all matched notes.)\n\n"
+                )
+    else:
+        note_ids_for_pearl = []
 
-    mw.progress.start(
-        max=len(note_ids),
-        min=0,
-        label="Injecting NBOME pearls…",
-        parent=mw,
-        immediate=True,
-    )
     updated = 0
+    skipped_pre_api = 0
     errors: list[str] = []
-    try:
-        for i, nid in enumerate(note_ids):
-            mw.progress.update(
-                value=i + 1,
-                label=f"NBOME pearls ({i + 1}/{len(note_ids)})",
-            )
-            QApplication.processEvents()
-            try:
-                note = mw.col.get_note(nid)
-            except Exception:
-                errors.append(
-                    f"note {nid}: could not open matching note (internal error). Skipped."
+    if run_pearl and note_ids_for_pearl:
+        mw.progress.start(
+            max=len(note_ids_for_pearl),
+            min=0,
+            label=(
+                "Updating NBOME pearls…"
+                if replace_pearl
+                else "Injecting NBOME pearls…"
+            ),
+            parent=mw,
+            immediate=True,
+        )
+        try:
+            for i, nid in enumerate(note_ids_for_pearl):
+                mw.progress.update(
+                    value=i + 1,
+                    label=f"NBOME pearls ({i + 1}/{len(note_ids_for_pearl)})",
                 )
-                continue
+                QApplication.processEvents()
+                try:
+                    note = mw.col.get_note(nid)
+                except Exception:
+                    errors.append(
+                        f"note {nid}: could not open matching note (internal error). Skipped."
+                    )
+                    continue
 
-            try:
-                note[target_field]
-            except Exception:
-                errors.append(
-                    f"note {nid}: this note has no “{target_field}” field. "
-                    f"Set “target_field” in Add-on Config or fix the note type. Skipped."
+                try:
+                    note[target_field]
+                except Exception:
+                    errors.append(
+                        f"note {nid}: this note has no “{target_field}” field. "
+                        f"Set “target_field” in Add-on Config or fix the note type. Skipped."
+                    )
+                    continue
+
+                front = _field_text(note, "Text", "Front")
+                back = _field_text(note, "Back Extra", "Back")
+                if not (front or back):
+                    errors.append(
+                        f"note {nid}: no Text/Front or Back Extra/Back content found. Skipped."
+                    )
+                    continue
+
+                current_target = str(note[target_field] or "")
+
+                if replace_pearl:
+                    if not _field_has_valid_nbome_marker_block(current_target):
+                        if "NBOME Pearl:" in current_target:
+                            skipped_pre_api += 1
+                            continue
+                        if (
+                            _NBOME_INJECT_START in current_target
+                            or _NBOME_INJECT_END in current_target
+                        ):
+                            skipped_pre_api += 1
+                            continue
+                    apply_replace = True
+                else:
+                    apply_replace = False
+                    if _NBOME_INJECT_START in current_target:
+                        skipped_pre_api += 1
+                        continue
+                    if "NBOME Pearl:" in current_target:
+                        skipped_pre_api += 1
+                        continue
+
+                try:
+                    pearl = _call_gemini(
+                        api_key, front, back, comlex_level=comlex_level
+                    )
+                except Exception as exc:
+                    errors.append(f"note {nid}: {_friendly_api_one_line(exc)}")
+                    continue
+
+                safe_pearl = _escape_preserving_b_tags(pearl).replace("\n", "<br>")
+                new_field, skip_reason = _apply_nbome_pearl_to_field(
+                    current_target,
+                    safe_pearl,
+                    replace_existing=apply_replace,
                 )
-                continue
-
-            front = _field_text(note, "Text", "Front")
-            back = _field_text(note, "Back Extra", "Back")
-            if not (front or back):
-                errors.append(
-                    f"note {nid}: no Text/Front or Back Extra/Back content found. Skipped."
-                )
-                continue
-
-            # Duplicate Shield: do not inject a second pearl into the same note.
-            current_target = note[target_field] or ""
-            if "NBOME Pearl:" in str(current_target):
-                continue
-
-            try:
-                pearl = _call_gemini(
-                    api_key, front, back, comlex_level=comlex_level
-                )
-            except Exception as exc:
-                errors.append(f"note {nid}: {_friendly_api_one_line(exc)}")
-                continue
-
-            safe_pearl = _escape_preserving_b_tags(pearl).replace("\n", "<br>")
-            suffix = (
-                "<br><br><b style='color:#007BFF;'>NBOME Pearl:</b><br>"
-                f"{safe_pearl}"
-            )
-            current = note[target_field] or ""
-            note[target_field] = current + suffix
-            try:
-                mw.col.update_note(note)
-            except Exception:
-                errors.append(
-                    f"note {nid}: could not save changes to this note. Skipped."
-                )
-                continue
-            updated += 1
-    finally:
-        mw.progress.finish()
+                if new_field is None:
+                    if skip_reason in ("legacy_pearl", "invalid_marker_block", "bad_marker_order"):
+                        errors.append(
+                            f"note {nid}: skipped due to non-replaceable existing NBOME pearl/marker format."
+                        )
+                    elif skip_reason:
+                        skipped_pre_api += 1
+                    continue
+                note[target_field] = new_field
+                try:
+                    mw.col.update_note(note)
+                except Exception:
+                    errors.append(
+                        f"note {nid}: could not save changes to this note. Skipped."
+                    )
+                    continue
+                updated += 1
+        finally:
+            mw.progress.finish()
 
     if updated > 0:
         _persist_usage(today, count_before + updated)
@@ -776,6 +1309,15 @@ def _inject_nbome_pearls_impl() -> None:
         updated_this_run=updated,
     )
 
+    skip_note = ""
+    if skipped_pre_api > 0:
+        skip_note = (
+            f"\n\n{skipped_pre_api} note(s) were skipped without calling Gemini "
+            "(manual “NBOME Pearl:” content without add-on markers, or partial marker comments)."
+        )
+
+    sched_note = f"\n\n{scheduler_summary}" if scheduler_summary else ""
+
     if errors:
         preview = "\n".join(errors[:6])
         extra = f"\n\n… and {len(errors) - 6} more issue(s)." if len(errors) > 6 else ""
@@ -786,35 +1328,80 @@ def _inject_nbome_pearls_impl() -> None:
                 "Tools → Add-ons → Config, and check quota and billing in Google AI Studio."
             )
         if updated == 0:
-            showWarning(
+            _present_nbome_outcome(
                 "No notes were updated.\n\n"
                 f"{preview}{extra}"
+                f"{sched_note}"
+                f"{skip_note}"
                 f"{api_hint}"
-                f"{footer_usage}"
+                f"{footer_usage}".strip(),
+                qid_report,
+                as_warning=True,
             )
         else:
-            showWarning(
+            _present_nbome_outcome(
                 f"Finished with {updated} note(s) updated. "
                 f"Some items were skipped ({len(errors)}).\n\n"
                 f"{preview}{extra}"
+                f"{sched_note}"
+                f"{skip_note}"
                 f"{api_hint}"
-                f"{footer_usage}"
+                f"{footer_usage}".strip(),
+                qid_report,
+                as_warning=True,
             )
         return
 
-    showInfo(
-        f"Success: injected NBOME pearls into the “{target_field}” field "
-        f"for {updated} note(s)."
-        f"{footer_usage}"
-        + _SUCCESS_ATTRIBUTION
+    if updated > 0:
+        pearl_verb = "replaced" if replace_pearl else "injected"
+        pearl_line = (
+            f"Pearls: {pearl_verb} NBOME text in the “{target_field}” field "
+            f"for {updated} note(s)."
+        )
+        body = f"{scheduler_summary}\n\n{pearl_line}" if scheduler_summary else pearl_line
+        _present_nbome_outcome(
+            f"{pearl_cap_notice}{body}{skip_note}{footer_usage}".strip(),
+            qid_report,
+            as_warning=False,
+            append_attribution=True,
+        )
+        return
+
+    tail_summary = f"No notes were updated.{sched_note}{skip_note}{footer_usage}"
+    if scheduler_done:
+        if run_pearl:
+            _present_nbome_outcome(
+                f"{scheduler_summary}\n\nNo pearl field updates.{skip_note}{footer_usage}".strip(),
+                qid_report,
+                as_warning=True,
+            )
+        else:
+            _present_nbome_outcome(
+                f"{scheduler_summary}{footer_usage}".strip(),
+                qid_report,
+                as_warning=False,
+                append_attribution=True,
+            )
+        return
+    if run_pearl:
+        _present_nbome_outcome(tail_summary.strip(), qid_report, as_warning=True)
+        return
+    _present_nbome_outcome(
+        f"Nothing completed.{footer_usage}".strip(),
+        qid_report,
+        as_warning=True,
     )
 
 
 def _on_main_window_init() -> None:
-    mw.addonManager.setConfigAction(__name__, _show_config_dialog)
+    _register_nbome_config_ui()
     action = QAction("Inject NBOME Pearls (UWorld IDs)", mw)
     qconnect(action.triggered, _inject_nbome_pearls)
     mw.form.menuTools.addAction(action)
 
 
 gui_hooks.main_window_did_init.append(_on_main_window_init)
+try:
+    gui_hooks.addons_dialog_will_show.append(_register_nbome_config_ui)
+except AttributeError:
+    pass
